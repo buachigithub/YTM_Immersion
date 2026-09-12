@@ -2,6 +2,7 @@
   "manifest_version": 3,
   "name": "YTM-Immersion",
   "version": "2.0.1",
+  "version_name": "2.0.1-PlusBee",
   "description": "YouTube Musicをもっと美しく",
   "permissions": [
     "storage",

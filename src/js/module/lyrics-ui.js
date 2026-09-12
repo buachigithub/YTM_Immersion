@@ -6083,7 +6083,10 @@ function renderSettingsPanel() {
   };
 
   let extVersion = '';
-  try { extVersion = (EXT && EXT.runtime && EXT.runtime.getManifest) ? (EXT.runtime.getManifest().version || '') : ''; } catch (_) { }
+  try {
+    const mf = (EXT && EXT.runtime && EXT.runtime.getManifest) ? EXT.runtime.getManifest() : null;
+    extVersion = (mf && (mf.version_name || mf.version)) || '';
+  } catch (_) { }
 
   ui.settings.innerHTML = `
       <div class="settings-tabs">
