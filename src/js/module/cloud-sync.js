@@ -503,31 +503,58 @@
       }
     }, 3000);
   };
+  const isExtensionValid = () => {
+    try {
+      return Boolean(typeof chrome !== 'undefined' && chrome?.runtime?.id);
+    } catch {
+      return false;
+    }
+  };
+
   const storage = {
-    _api: chrome?.storage?.local,
     get: (k) => new Promise(r => {
-      if (!storage._api) return r(null);
-      storage._api.get([k], res => {
-        const val = res ? res[k] : undefined;
-        r(val !== undefined ? val : null);
-      });
+      if (!isExtensionValid() || !chrome?.storage?.local) return r(null);
+      try {
+        chrome.storage.local.get([k], res => {
+          if (chrome?.runtime?.lastError) return r(null);
+          const val = res ? res[k] : undefined;
+          r(val !== undefined ? val : null);
+        });
+      } catch {
+        r(null);
+      }
     }),
  
     set: (k, v) => new Promise(resolve => {
-      if (storage._api) {
-        storage._api.set({ [k]: v }, resolve);
-      } else {
+      if (!isExtensionValid() || !chrome?.storage?.local) return resolve();
+      try {
+        chrome.storage.local.set({ [k]: v }, () => {
+          resolve();
+        });
+      } catch {
         resolve();
       }
     }),
 
     remove: (k) => new Promise(resolve => {
-      if (storage._api) {
-        storage._api.remove(k, resolve);
-      } else {
+      if (!isExtensionValid() || !chrome?.storage?.local) return resolve();
+      try {
+        chrome.storage.local.remove(k, () => {
+          resolve();
+        });
+      } catch {
         resolve();
       }
     }),
 
-    clear: () => confirm('全データを削除しますか？') && storage._api?.clear(() => location.reload())
+    clear: () => {
+      if (!isExtensionValid() || !chrome?.storage?.local) return;
+      if (confirm('全データを削除しますか？')) {
+        try {
+          chrome.storage.local.clear(() => location.reload());
+        } catch {
+          // Extension context invalidated
+        }
+      }
+    }
   };
