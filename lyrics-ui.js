@@ -68,6 +68,101 @@ const parseBaseLRC = (lrc) => {
   return lines;
 };
 
+// ── 先頭に紛れ込む見出し行 ──────────────────────────────────
+// 取得元によっては、1行目に曲そのものではない行が入っている。
+//
+//   - QQ音楽由来の同期データ: 「制作人：〜」「作詞：〜」のクレジット行
+//   - SimpMusic の richsync : 「曲名 - アーティスト (…)」の見出し行
+//
+// どちらも本物の歌詞と同じタイムスタンプ付きなので、そのまま出すと
+// イントロの間ずっと曲名がハイライトされ続ける。上流のデータは直せない
+// ので、表示する行からだけ落とす。
+//
+// 落とすのは必ず「先頭から連続する分だけ」。1行でも該当しない行が来たら
+// そこで打ち切るので、曲中の歌詞を巻き込むことはない。
+// 元データ側は触らない。歌手の色分けは行番号で歌詞に対応づけられていて、
+// データから消すと1行ずれるため。
+const LYRIC_CREDIT_LABELS = [
+  '制作人', '製作人', '制作', '製作', '出品', '监制', '監製',
+  '作詞', '作词', '作曲', '编曲', '編曲', '词曲', '詞曲',
+  '混音', '録音', '录音', '母带', '母帶', '和声', '和聲',
+  'produced by', 'producer', 'lyrics', 'lyricist', 'lyric',
+  'music', 'composer', 'composed by', 'arranged by', 'arranger',
+  'vocal', 'chorus', 'mixing', 'mastering', 'op', 'sp',
+];
+
+// 全角・大文字・語中の空白を潰してから突き合わせる。
+// 「Produced by」と「producedby」を別物として扱わないため、
+// 既知ラベル側も同じ形に均しておく。
+const normalizeCreditLabel = (value) => String(value ?? '')
+  .normalize('NFKC')
+  .toLowerCase()
+  .replace(/\s+/g, '');
+
+const LYRIC_CREDIT_LABEL_KEYS = LYRIC_CREDIT_LABELS.map(normalizeCreditLabel);
+
+const isLyricCreditLine = (text) => {
+  const raw = String(text ?? '').trim();
+  if (!raw) return false;
+  // 「ラベル：値」の形だけを見る。コロンが無ければクレジット行ではない。
+  const m = raw.match(/^([^:：]{1,24})[:：]/);
+  if (!m) return false;
+  const label = normalizeCreditLabel(m[1]);
+  if (!label) return false;
+  // 「作詞作曲」のような連結にも当たるよう包含で見る
+  return LYRIC_CREDIT_LABEL_KEYS.some(known => label.includes(known));
+};
+
+const normalizeLyricHeaderText = (value) => String(value ?? '')
+  .normalize('NFKC')
+  .toLowerCase()
+  .replace(/\s+/g, '');
+
+// 曲名を含む見出し行。曲名がそのまま歌い出しになる曲を巻き込まないよう、
+// 「曲の頭に置かれている」「次の歌詞まで大きく空いている」「その空きが
+// 他の行間隔と比べて明らかに異常」の3つが揃った時だけ見出しとみなす。
+const isLyricTitleHeaderLine = (line, nextLine, medianGapSec, trackTitle) => {
+  const title = normalizeLyricHeaderText(trackTitle);
+  const text = normalizeLyricHeaderText(line?.text);
+  if (!title || !text || title.length < 2) return false;
+  if (!text.includes(title)) return false;
+  if (typeof line?.time !== 'number' || line.time > 5) return false;
+  if (typeof nextLine?.time !== 'number') return false;
+  const gap = nextLine.time - line.time;
+  if (gap < 10) return false;
+  if (!(medianGapSec > 0) || gap < medianGapSec * 4) return false;
+  return true;
+};
+
+const MAX_STRIPPED_HEADER_LINES = 6;
+
+const stripLeadingHeaderLines = (lines, trackTitle) => {
+  if (!Array.isArray(lines) || lines.length < 3) return lines;
+
+  const gaps = [];
+  for (let i = 1; i < lines.length; i++) {
+    const prev = lines[i - 1]?.time;
+    const cur = lines[i]?.time;
+    if (typeof prev === 'number' && typeof cur === 'number') gaps.push(cur - prev);
+  }
+  gaps.sort((a, b) => a - b);
+  const medianGapSec = gaps.length ? gaps[Math.floor(gaps.length / 2)] : 0;
+
+  let start = 0;
+  while (start < lines.length - 1 && start < MAX_STRIPPED_HEADER_LINES) {
+    const line = lines[start];
+    if (isLyricCreditLine(line?.text)) { start += 1; continue; }
+    if (isLyricTitleHeaderLine(line, lines[start + 1], medianGapSec, trackTitle)) {
+      start += 1;
+      continue;
+    }
+    break;
+  }
+
+  if (!start) return lines;
+  return lines.slice(start);
+};
+
 const MAX_SINGER_NUMBER = 32;
 
 const normalizeSingerNumber = (value) => {
@@ -368,6 +463,34 @@ const isLineDynamicallyActiveAtTime = (line, timeSec, tolerance = DYNAMIC_OVERLA
     typeof endSec === 'number' &&
     (timeSec + tolerance) >= startSec &&
     timeSec <= (endSec + tolerance);
+};
+
+// 画面で「いまの行」を、次の行が始まるまで明るいまま残す。
+//
+// 終わり時刻を持つのは文字同期の行だけで、そこで active を外すと
+// 色が #fff → rgba(255,255,255,0.3)、大きさが 1.05 → 0.95 に落ち、
+// さらに .ytm-word-sync:not(.active) で塗りのグラデーションごと消える。
+// 行間が空く曲では、その状態が数秒続く。実測: Dear (Mrs. GREEN APPLE) は
+// 歌 166秒 に対して行間の空きが 101秒あり、点いて消えて点いて消えて、
+// に見えていた。行同期の歌詞は終わり時刻を持たないのでこうならず、
+// 「同期が細かい曲ほど見え方が悪くなる」という逆転になっていた。
+//
+// 他に本当に歌っている行があるならそちらに譲る(デュエット・重なり)。
+//
+// これは画面だけの判断。Discord などへ渡す「いま歌っている文字列」は
+// getCurrentPlaybackLyricText 側で別に決める。あちらは誰も歌っていない
+// 間は空にするのが正しい(古い行を出すと、まだ歌っていると嘘になる)。
+const isPrimaryRowLitAtTime = (lines, primaryIndex, timeSec) => {
+  const primary = Array.isArray(lines) ? lines[primaryIndex] : null;
+  if (!primary) return false;
+  const hasRange = Number.isFinite(primary._dynamicRenderStartSec) &&
+    Number.isFinite(primary._dynamicRenderEndSec);
+  if (!hasRange) return true;
+  if (isLineDynamicallyActiveAtTime(primary, timeSec)) return true;
+  if (timeSec < primary._dynamicRenderStartSec) return false;
+  return !lines.some((line, i) => (
+    i !== primaryIndex && isLineDynamicallyActiveAtTime(line, timeSec)
+  ));
 };
 
 const isSameTimestamp = (a, b, tolerance = SAME_TIMESTAMP_TOLERANCE) =>
@@ -888,16 +1011,61 @@ const getSubDynamicLineForTime = (sec) => {
 
 // 歌詞ソースの優先設定。'ytm' か 'lrchub' の2択で、どちらも他ソースへフォールバックする。
 // 旧バージョンの 'standard' / 'ytm_only' / 'lrclib' もここで吸収する。
+// 歌詞ソース設定は「YTM優先 / LRCHub優先」の2択になった。
+// それ以前の保存値をどう引き継ぐかの対応表:
+//   ytm / ytm_only … そのまま YTM優先
+//   lrchub         … 明示的に LRCHub を選んだ意思とみなして尊重する
+//   standard       … 旧デフォルト。特に選んでいないので、新しい既定値へ
+//   lrclib         … 旧「LRCLIB優先」。その選択肢自体が無くなったので既定値へ
+//   未設定 / 不明   … 既定値
+// 既定値を YTM優先 にしているのは、videoId で曲を一意に特定できる YTM の方が
+// 誤マッチが起きず、タイミングも配信元のデータそのままで正確なため。
+// 背景の明るさの既定値。CSS 側の var() のフォールバックとも揃えること。
+const DEFAULT_BG_BRIGHTNESS = 0.65;
+
+// 歌詞ソースは「YTM 優先 / LRCHub 優先」の2択。どちらも他方(と残りの
+// 取得元)へ自動で落ちるので、選んだせいで歌詞が出なくなることはない。
+//
+// 以前あった 'external'(SimpMusic / LyricsPlus のみ)は撤去した。
+// あれは「優先」ではなく「他を全部禁止」という別種のつまみで、空振りすると
+// 歌詞が出ない。新しい取得元を単体で評価するための一時的な項目だったが、
+// その評価は終わり、両者とも通常の競走に参加している。
 const normalizeSourceMode = (value) => (
   (value === 'ytm' || value === 'ytm_only') ? 'ytm'
-    : (value === 'lrchub' || value === 'standard' || value === 'lrclib') ? 'lrchub'
+    : (value === 'lrchub') ? 'lrchub'
       : 'ytm'
 );
 
+// Apple Music 風の同期表示は body のクラスで切り替える。
+// 軽量モードでも動かす。
+//
+// 以前はここで一緒に止めていたが、止める根拠が無かった。
+// 塗り(--sweep)も持ち上がり・膨らみ(transform)も Web Animations の
+// キーフレームで合成側に渡してあり、メインスレッドの毎フレーム処理は 0。
+// 軽量モードが本当に止めたいのは backdrop-filter のぼかしと背景ドリフトで、
+// あちらは「ドリフトの毎フレーム、ビューポート全面のブラーを再計算」する
+// (style.css の同名ブロックの注釈を参照)。桁が違う。
+// 設定の文言も「背景アニメーション停止」であって、歌詞の話ではない。
+//
+// メインスレッドを毎フレーム使うのは光(--wg → text-shadow)だけなので、
+// 軽量モードではそこだけ落とす(measureLyricLineSweep の _glow)。
+const applyAppleSyncClass = () => {
+  if (typeof document === 'undefined' || !document.body) return;
+  document.body.classList.toggle('ytm-apple-sync', !!config.appleSyncStyle);
+};
+
+// YTM の取得を待つ上限。next → browse の2段直列で各段 5 秒あるので、
+// 待ち切ると最大10秒ほど白紙になる。ここで切って先に他の歌詞を出し、
+// 遅れて届いた YTM は applyLateLyricsUpgrade に差し替えを任せる。
+const YTM_EARLY_WAIT_MS = 1500;
+
 // いま表示している歌詞が「YTM優先」設定によって選ばれたものか。
-// true の間は、あとから届く LRCHub の高品質差し替えを受け付けない
-// (手動で候補を選んだときと同じ扱い)。
+// 通常の別ソースでは差し替えないが、アニメーション表示を有効にしている
+// ときの LRCHub srv3 は表示モードそのものなので、後着でも受け付ける。
 let currentLyricsFromPreferredYtm = false;
+// Immersion が開いていて再生位置を継続的に追えていたか。
+// 連続再生の offset 補正を適用してよいかの判断に使う。
+let _wasTrackingPlayback = false;
 
 let animatedCaptionData = null;
 let animatedCaptionFrameKey = '';
@@ -959,22 +1127,52 @@ const extractTimedTextSegments = (node, inheritedPenId = '') => {
   return segments;
 };
 
+const getTimedTextPenOpacity = (pen) => {
+  if (pen?.fo === undefined) return 1;
+  const value = Number(pen.fo);
+  return Number.isFinite(value) ? Math.max(0, Math.min(1, value / 254)) : 1;
+};
+
+const hasTimedTextVisibleEdge = (pen) => (
+  !!pen &&
+  String(pen.et || '0') !== '0' &&
+  /^#[0-9a-f]{6}$/i.test(String(pen.ec || ''))
+);
+
+const isTimedTextPenVisible = (pen) => (
+  getTimedTextPenOpacity(pen) > 0 || hasTimedTextVisibleEdge(pen)
+);
+
+const getTimedTextVisibleText = (segments, cuePenId, cuePen, pens) => {
+  if (!isTimedTextPenVisible(cuePen)) return '';
+  const normalizedCuePenId = String(cuePenId || '');
+  const visible = (Array.isArray(segments) ? segments : []).filter((segment) => {
+    const segmentPenId = String(segment?.penId || '');
+    if (!segmentPenId || segmentPenId === normalizedCuePenId) return true;
+    return isTimedTextPenVisible(pens?.get?.(segmentPenId) || {});
+  });
+  return normalizeTimedTextCaption(visible.map(segment => segment.text).join(''));
+};
+
 const buildTimedTextPlainLines = (events) => {
   const lines = [];
   const normalize = (value) => String(value || '').replace(/\s+/g, ' ').trim();
 
   events.forEach((event) => {
-    const text = normalizeTimedTextCaption(event.text);
+    const sourceText = typeof event?.visibleText === 'string' ? event.visibleText : event?.text;
+    const text = normalizeTimedTextCaption(sourceText);
     const norm = normalize(text);
     if (!norm) return;
 
     const last = lines[lines.length - 1];
     if (last && event.time <= (last.endTime || last.time) + 0.35) {
       const lastNorm = normalize(last.text);
-      if (norm === lastNorm) return;
+      if (norm === lastNorm) {
+        last.endTime = Math.max(last.endTime || last.time, event.endTime || event.time);
+        return;
+      }
       if (norm.includes(lastNorm) || lastNorm.includes(norm)) {
         if (norm.length >= lastNorm.length) {
-          last.time = event.time;
           last.endTime = event.endTime;
           last.text = text;
         }
@@ -991,6 +1189,20 @@ const buildTimedTextPlainLines = (events) => {
 
   return lines.map(({ time, text }) => ({ time, text }));
 };
+
+// srv3 の短い <p> は、それ自体がアニメーションの1フレーム。
+// 前後に許容時間を足すと、次の位置/透明度フレームまで同時表示されて
+// 残像になるため、開始を含み終了を含まない区間で厳密に選ぶ。
+const getActiveTimedTextEvents = (events, timeMs, limit = 24) => (
+  (Array.isArray(events) ? events : [])
+    .filter(event => (
+      Number.isFinite(event?.startMs) &&
+      Number.isFinite(event?.endMs) &&
+      timeMs >= event.startMs &&
+      timeMs < event.endMs
+    ))
+    .slice(-Math.max(1, Number(limit) || 24))
+);
 
 const parseTimedTextAnimation = (xmlText) => {
   if (!isTimedTextXml(xmlText) || typeof DOMParser === 'undefined') return null;
@@ -1016,20 +1228,27 @@ const parseTimedTextAnimation = (xmlText) => {
       const segments = extractTimedTextSegments(p, penId);
       const text = normalizeTimedTextCaption(segments.map(s => s.text).join(''));
       if (!text) return;
+      const pen = pens.get(String(penId)) || {};
+      const visibleText = getTimedTextVisibleText(segments, penId, pen, pens);
+      // d が明示された srv3 の <p> は、その長さ自体がアニメーションの
+      // 1フレーム。33ms/34ms の正規フレームを60msへ延ばすと、次の
+      // フレームと重なって残像になる。欠落または0のときだけ補完する。
+      const frameDurationMs = durationMs > 0 ? durationMs : 60;
 
       events.push({
         id: index,
         time: startMs / 1000,
-        endTime: (startMs + Math.max(60, durationMs || 0)) / 1000,
+        endTime: (startMs + frameDurationMs) / 1000,
         startMs,
-        endMs: startMs + Math.max(60, durationMs || 0),
+        endMs: startMs + frameDurationMs,
         durationMs,
         text,
+        visibleText,
         segments: segments.length ? segments : [{ text, penId }],
         penId,
         wpId,
         wsId,
-        pen: pens.get(String(penId)) || {},
+        pen,
         window: windows.get(String(wpId)) || {},
         windowStyle: windowStyles.get(String(wsId)) || {},
       });
@@ -1069,14 +1288,33 @@ const getTimedTextAnchorTransform = (anchorPoint) => {
 const getTimedTextAlign = (windowStyle) => {
   const ju = Number(windowStyle?.ju);
   if (ju === 0) return 'left';
-  if (ju === 2) return 'right';
-  return 'center';
+  if (ju === 1) return 'right';
+  return 'center'; // srv3: ju=2
 };
 
 const getTimedTextScaledFontSize = (rawSize, fallback = 140) => {
   const numeric = Number(rawSize);
   const sourceSize = Number.isFinite(numeric) && numeric > 0 ? numeric : fallback;
   return Math.max(20, Math.min(98, sourceSize * 0.30));
+};
+
+const getTimedTextForegroundColor = (pen, fallback = '#FEFEFE') => {
+  const color = /^#[0-9a-f]{6}$/i.test(String(pen?.fc || '')) ? pen.fc : fallback;
+  const alpha = getTimedTextPenOpacity(pen);
+  if (alpha >= 0.999) return color;
+  const red = parseInt(color.slice(1, 3), 16);
+  const green = parseInt(color.slice(3, 5), 16);
+  const blue = parseInt(color.slice(5, 7), 16);
+  return `rgba(${red},${green},${blue},${alpha.toFixed(3)})`;
+};
+
+const getTimedTextShadow = (pen) => {
+  if (hasTimedTextVisibleEdge(pen)) {
+    return `0 0 2px ${pen.ec}, 0 2px 8px rgba(0,0,0,.72)`;
+  }
+  return getTimedTextPenOpacity(pen) > 0
+    ? '0 2px 10px rgba(0,0,0,.72)'
+    : 'none';
 };
 
 const getAnimatedCaptionFontScale = () => {
@@ -1100,12 +1338,8 @@ const getTimedTextCueStyle = (event) => {
   const scale = getAnimatedCaptionFontScale();
   const baseFontSize = getTimedTextScaledFontSize(pen.sz, 140);
   const fontSize = baseFontSize * scale;
-  const opacity = pen.fo !== undefined ? Math.max(0, Math.min(1, Number(pen.fo) / 254)) : 1;
-  const color = /^#[0-9a-f]{6}$/i.test(pen.fc || '') ? pen.fc : '#FEFEFE';
-  const edgeColor = /^#[0-9a-f]{6}$/i.test(pen.ec || '') ? pen.ec : '#000000';
-  const textShadow = pen.ec
-    ? `0 0 2px ${edgeColor}, 0 2px 8px rgba(0,0,0,.72)`
-    : '0 2px 10px rgba(0,0,0,.72)';
+  const color = getTimedTextForegroundColor(pen);
+  const textShadow = getTimedTextShadow(pen);
 
   return [
     `left:${left}%`,
@@ -1114,28 +1348,63 @@ const getTimedTextCueStyle = (event) => {
     `--ytm-animated-base-font-size:${baseFontSize}px`,
     `font-size:${fontSize}px`,
     `color:${color}`,
-    `opacity:${opacity}`,
     `text-shadow:${textShadow}`,
     `text-align:${getTimedTextAlign(event.windowStyle)}`,
     pen.i === '1' ? 'font-style:italic' : '',
   ].filter(Boolean).join(';');
 };
 
+const shouldApplyTimedTextSegmentPen = (segment, event) => {
+  const segmentPenId = String(segment?.penId || '');
+  const cuePenId = String(event?.penId || '');
+  // p の pen は親要素ですでに適用済み。同じ pen を span にも適用すると
+  // fo (opacity) が二重に掛かり、フェードフレームがほぼ見えなくなる。
+  return !!segmentPenId && segmentPenId !== cuePenId;
+};
+
 const getTimedTextSegmentHtml = (event) => (
   ((segments, scale) => segments.map(segment => {
+    if (!shouldApplyTimedTextSegmentPen(segment, event)) return escapeHtml(segment.text);
     const pen = animatedCaptionData?.pens?.get(String(segment.penId || event.penId)) || event.pen || {};
-    const color = /^#[0-9a-f]{6}$/i.test(pen.fc || '') ? pen.fc : '';
-    const opacity = pen.fo !== undefined ? Math.max(0, Math.min(1, Number(pen.fo) / 254)) : null;
+    const color = getTimedTextForegroundColor(pen, '#FEFEFE');
     const size = Number(pen.sz || 0);
     const style = [
-      color ? `color:${color}` : '',
-      opacity !== null ? `opacity:${opacity}` : '',
+      `color:${color}`,
+      `text-shadow:${getTimedTextShadow(pen)}`,
       size ? `font-size:${(getTimedTextScaledFontSize(size, size) * scale).toFixed(2)}px` : '',
       pen.i === '1' ? 'font-style:italic' : '',
     ].filter(Boolean).join(';');
     return `<span${style ? ` style="${style}"` : ''}>${escapeHtml(segment.text)}</span>`;
   }).join(''))(event.segments || [{ text: event.text, penId: event.penId }], getAnimatedCaptionFontScale())
 );
+
+const syncTimedTextStage = (stage, activeEvents) => {
+  if (!stage) return;
+  const existing = new Map(
+    Array.from(stage.children || []).map(node => [String(node.dataset?.srv3EventId || ''), node])
+  );
+  const activeIds = new Set();
+  const ownerDocument = stage.ownerDocument || document;
+
+  activeEvents.forEach((event) => {
+    const eventId = String(event.id);
+    activeIds.add(eventId);
+    let cue = existing.get(eventId);
+    if (!cue) {
+      cue = ownerDocument.createElement('div');
+      cue.className = 'ytm-animated-caption-cue';
+      cue.dataset.srv3EventId = eventId;
+      cue.style.cssText = getTimedTextCueStyle(event);
+      cue.innerHTML = getTimedTextSegmentHtml(event);
+    }
+    // appendChild は既存nodeを破棄せず、srv3の重なり順だけを揃える。
+    stage.appendChild(cue);
+  });
+
+  existing.forEach((cue, eventId) => {
+    if (!activeIds.has(eventId)) cue.remove();
+  });
+};
 
 function renderAnimatedTimedText(captionData) {
   if (!ui.lyrics || !captionData) return;
@@ -1147,24 +1416,35 @@ function renderAnimatedTimedText(captionData) {
   document.body.classList.remove('ytm-no-lyrics', 'ytm-no-timestamp');
   document.body.classList.add('ytm-has-timestamp', 'ytm-animated-caption-mode');
   ui.lyrics.innerHTML = '<div class="ytm-animated-caption-stage" aria-live="off"></div>';
+  if (PipManager.pipWindow && PipManager.pipLyricsContainer) {
+    PipManager.pipLyricsContainer.innerHTML = ui.lyrics.innerHTML;
+    const pipBody = PipManager.pipWindow.document?.body;
+    if (pipBody) {
+      pipBody.classList.remove('ytm-no-lyrics', 'ytm-no-timestamp');
+      pipBody.classList.add('ytm-animated-caption-mode');
+      pipBody.classList.toggle('ytm-keep-past-lyrics', !!config.keepPastLyrics);
+    }
+  }
   const now = getCurrentPlaybackTimeSec();
   updateAnimatedCaptionStage(typeof now === 'number' ? now : 0, true);
 }
 
 function updateAnimatedCaptionStage(currentTime, force = false) {
   if (!animatedCaptionData || !ui.lyrics) return;
-  const stage = ui.lyrics.querySelector('.ytm-animated-caption-stage');
-  if (!stage) return;
+  const stages = [ui.lyrics.querySelector('.ytm-animated-caption-stage')];
+  if (PipManager.pipWindow && PipManager.pipLyricsContainer) {
+    stages.push(PipManager.pipLyricsContainer.querySelector('.ytm-animated-caption-stage'));
+  }
+  const availableStages = stages.filter(Boolean);
+  if (!availableStages.length) return;
   const tMs = Math.max(0, currentTime * 1000);
-  const active = animatedCaptionData.events
-    .filter(event => tMs + 40 >= event.startMs && tMs <= event.endMs + 40)
-    .slice(-24);
+  const active = getActiveTimedTextEvents(animatedCaptionData.events, tMs);
   const key = active.map(event => `${event.id}:${event.startMs}:${event.endMs}`).join('|');
   if (!force && key === animatedCaptionFrameKey) return;
   animatedCaptionFrameKey = key;
-  stage.innerHTML = active.map(event => (
-    `<div class="ytm-animated-caption-cue" style="${getTimedTextCueStyle(event)}">${getTimedTextSegmentHtml(event)}</div>`
-  )).join('');
+  availableStages.forEach(stage => {
+    syncTimedTextStage(stage, active);
+  });
 }
 
 function setupMovieMode() {
@@ -1193,6 +1473,51 @@ function setupMovieMode() {
   };
   check();
 };
+// ============================================================
+// ■ 未解決の不具合: Immersion ON のとき「曲 / 動画」の切り替えが効かない
+//   (2026-08-15 調査。次に触る人向けのメモ)
+//
+// 症状
+//   Immersion ON では「動画」を押しても playback-mode が ATV_PREFERRED の
+//   まま変わらない。OFF にすると、まったく同じ click() で即座に
+//   OMV_PREFERRED になり URL も MV の videoId へ変わる。
+//   つまり YTM 側は正常で、こちらが何かを邪魔している。
+//
+// これは以前からある不具合
+//   bringSwitcherOnly() は 2026-03-23 から一度も変わっていない
+//   (git log -S"bringSwitcherOnly" で確認済み)。
+//   コードが変わっていないのに動かなくなったので、原因は YTM 側の
+//   実装変更。同時期に、キューの ytmusic-player-queue-item から
+//   a 要素が消えて videoId が取れなくなる変更も入っている
+//   (queue-manager.js の _buildQueueIndex 参照)。同じ刷新の一部と思われる。
+//
+// 唯一つかんだ手がかり
+//   #ytm-custom-info-area ごと DOM から切り離した状態でクリックすると
+//   切り替えが成立した。この時 handleMutation → changeUIWithMovieMode 内の
+//   customSwitcherParent.appendChild(switcher) が例外で止まっている。
+//   ただし video 要素の移動はその前に走っているので、
+//   「動画要素の移動」ではなく「切り替え中の switcher の移動」が
+//   引き金である可能性が高い。
+//
+// 試して駄目だった案 (どれも切り替わらず)
+//   1. switcher を動かさず、自前の代理ボタンから本体を click() する
+//   2. 本体の visibility:hidden を打ち消してから click() する
+//   3. プレイヤーページの非表示と ytm-custom-layout を外してから click() する
+//   4. handleMutation の DOM 組み替えを 600ms 遅らせる
+//   1 が駄目だった点が上の仮説と噛み合っておらず、まだ何か見落としがある。
+//
+// 次に調べるとよさそうなこと
+//   - YTM 側のクリックハンドラが実際に走っているか (イベントリスナの確認)
+//   - ytmusic-player-page の内部状態 (player-page-open / player-ui-state) が
+//     切り替え処理の前提になっていないか
+//   - Immersion OFF の復帰処理 changeIModeUIWithMovieMode(false) が
+//     具体的に何を戻しているか。そこに必要条件が含まれているはず
+//
+// UI は今のところ従来どおり (トグルは表示したまま) にしてある。
+// 壊れているのを確認できたのが 2 環境だけで、YTM の段階的な配信で
+// まだ動く利用者が居る可能性を否定できないため。
+// 広く壊れていると分かったら、Immersion 中は非表示にするのが親切。
+// ============================================================
 function bringSwitcherOnly() {
   const switcher = document.querySelector("ytmusic-av-toggle");
   const customSwitcherParent = document.querySelector("#ytm-custom-info-area");
@@ -1739,6 +2064,7 @@ chrome.runtime.onMessage.addListener((msg) => {
     if (p.video_id && curVid && p.video_id !== curVid) return;
 
     if (Array.isArray(p.candidates)) lyricsCandidates = p.candidates;
+    mergeLyricsCandidates(p.mergeCandidates);
     if (p.config !== undefined) lyricsConfig = p.config;
     if (Array.isArray(p.requests)) lyricsRequests = p.requests;
     syncLyricsLockState();
@@ -1754,10 +2080,20 @@ chrome.runtime.onMessage.addListener((msg) => {
 
     // dynamic: char-timed lines can arrive later even if lyrics came from API
     if (Array.isArray(p.dynamicLines) && p.dynamicLines.length) {
-      dynamicLines = p.dynamicLines;
-      // re-render to attach per-char spans while keeping current lines/translations
-      if (Array.isArray(lyricsData) && lyricsData.length) {
-        renderLyrics(lyricsData);
+      const keepAnimatedStage = !!(
+        config.useAnimatedCaptions &&
+        animatedCaptionData &&
+        document.body.classList.contains('ytm-animated-caption-mode')
+      );
+      // srv3 is the selected top-level display mode. A late DynamicLRC metadata
+      // packet is an alternative representation, not permission to tear down
+      // the animated stage and restore ordinary lyric rows.
+      if (!keepAnimatedStage) {
+        dynamicLines = p.dynamicLines;
+        // re-render to attach per-char spans while keeping current lines/translations
+        if (Array.isArray(lyricsData) && lyricsData.length) {
+          renderLyrics(lyricsData);
+        }
       }
     }
 
@@ -1799,7 +2135,6 @@ const showToast = (text) => {
   }, 5000);
 };
 
-let fallbackToastTimer = null;
 let lyricsCacheWriteQueue = Promise.resolve();
 
 function enqueueLyricsCacheWrite(key, createValue, isCurrent) {
@@ -1816,38 +2151,195 @@ function enqueueLyricsCacheWrite(key, createValue, isCurrent) {
   return task;
 }
 
-function hideFallbackNotice() {
-  if (fallbackToastTimer) clearTimeout(fallbackToastTimer);
-  fallbackToastTimer = null;
-  const el = document.getElementById('ytm-fallback-toast');
-  if (el) el.classList.remove('visible');
-}
+// ── 取得元の表示 ──────────────────────────────────────────
+// 歌詞の出どころは LRCHub / YouTube Music / SimpMusic / LyricsPlus / LRCLIB と
+// 増えたうえ、同じ曲でも「先に返した方が勝つ」ので実行のたびに変わりうる。
+// 画面に出すかどうかは設定「いまの取得元を画面に表示する」だけで決める。
+// 以前はデバッグ(ytm_debug)でも強制的に出していたが、フラグを立てた人は
+// コンソールを見に行くのであって、画面の隅に居座らせてほしいわけではない。
+// しかも設定を切っても消せないので、消し方が分からなくなる。
+// デバッグで増えるのはコンソールへの記録だけにする。
+const LYRICS_SOURCE_LABELS = {
+  lrchub: 'LRCHub',
+  lrclib: 'LRCLIB',
+  ytm: 'YouTube Music',
+  simpmusic: 'SimpMusic',
+  lyricsplus: 'LyricsPlus',
+};
 
-function showFallbackNotice() {
-  let el = document.getElementById('ytm-fallback-toast');
-  if (!el) {
-    el = createEl('div', 'ytm-fallback-toast', '', 'LrcLib の歌詞を一時表示しています');
-    el.setAttribute('role', 'status');
-    el.setAttribute('aria-live', 'polite');
-    document.body.appendChild(el);
+// 並びは selectLyricsPayload の quality と対応させること。
+// 統合時に上流が 3(単語同期) と 4(srv3 字幕) を入れ替えたので、
+// ここも入れ替えてある。片方だけ直すと表示が嘘になる。
+const LYRICS_QUALITY_LABELS = ['', '時刻なし', '行同期', '単語同期', '字幕同期'];
+
+// ── 手を動かしている間だけ出すもの ──────────────────────
+// 聴いているだけの間は画面に何も足さない。没入が主眼なので、常設の
+// 表示は置かない。ただし「歌詞がずれている」と気づいた人は必ず何か
+// 操作しようとしてマウスを動かすので、その瞬間に出す。
+// 動画プレイヤーの操作盤と同じ作法。
+//
+// 「歌詞にホバーしたら」にはしない。バッジは左下、歌詞は右側なので、
+// 手を伸ばす途中で条件が切れて消えてしまう。
+const POINTER_IDLE_HIDE_MS = 2600;
+let pointerIdleTimer = null;
+// 手を置いたままでも届く mousemove がある。Chrome は scrollTop が動くと、
+// カーソルの下にある物が変わったかを取り直すために、同じ座標の mousemove を
+// 投げてくる。歌詞は行が変わるたびに毎フレーム scrollTop を書くので、画面の
+// 上にカーソルを置いたままにしていると、曲が続くかぎりそれが届き続け、
+// 「ずっと手を動かしている」ことになってバッジが引っ込まなかった。
+// 座標が動いた時だけ本物の操作として扱う。
+let lastPointerX = null;
+let lastPointerY = null;
+
+const notePointerActivity = (ev) => {
+  if (typeof document === 'undefined' || !document.body) return;
+  if (ev && ev.type === 'mousemove') {
+    if (ev.clientX === lastPointerX && ev.clientY === lastPointerY) return;
+    lastPointerX = ev.clientX;
+    lastPointerY = ev.clientY;
   }
-  el.classList.add('visible');
-  if (fallbackToastTimer) clearTimeout(fallbackToastTimer);
-  fallbackToastTimer = setTimeout(() => {
-    fallbackToastTimer = null;
-    el.classList.remove('visible');
-  }, 4500);
+  document.body.classList.add('ytm-pointer-active');
+  if (pointerIdleTimer) clearTimeout(pointerIdleTimer);
+  pointerIdleTimer = setTimeout(() => {
+    pointerIdleTimer = null;
+    document.body.classList.remove('ytm-pointer-active');
+  }, POINTER_IDLE_HIDE_MS);
+};
+
+const setupPointerActivityWatch = () => {
+  if (typeof document === 'undefined') return;
+  // 毎フレーム走るので、やるのはクラス付与とタイマー再設定だけに留める
+  document.addEventListener('mousemove', notePointerActivity, { passive: true });
+  document.addEventListener('mousedown', notePointerActivity, { passive: true });
+};
+
+// ── ズレ直し ────────────────────────────────────────────
+// 歌詞のズレは、気づくのが歌詞を見ている時なのに、直すつまみは設定パネルの
+// 奥にあった。同じ問題への答え(取得元を替える / ズレを直す)は同じ場所に
+// 置く。値そのものは前からある config.syncOffset で、ここは入口だけ。
+//
+// 既定では曲が変わるとリセットされる(設定「曲が切り替わったときに
+// オフセットをリセットしない」で変えられる)。曲ごとの手当てなので、
+// 引きずらない方が既定として妥当。
+const LYRIC_OFFSET_STEP_MS = 100;
+const LYRIC_OFFSET_MAX_MS = 10000;
+
+const formatLyricOffset = (ms) => {
+  const sec = (Number(ms) || 0) / 1000;
+  return `${sec > 0 ? '+' : ''}${sec.toFixed(1)}s`;
+};
+
+const refreshLyricOffsetUi = () => {
+  if (!ui.uploadMenu) return;
+  const el = ui.uploadMenu.querySelector('[data-role="offset-value"]');
+  if (el) el.textContent = formatLyricOffset(config.syncOffset);
+};
+
+const applyLyricOffsetMs = (ms) => {
+  const clamped = Math.max(-LYRIC_OFFSET_MAX_MS, Math.min(LYRIC_OFFSET_MAX_MS, Math.round(Number(ms) || 0)));
+  config.syncOffset = clamped;
+  refreshLyricOffsetUi();
+  // 設定パネルを開いている時は、そちらの数値も合わせる
+  const input = document.getElementById('sync-offset-input');
+  if (input) input.valueAsNumber = clamped;
+  void storage.set('ytm_sync_offset', clamped);
+};
+
+// 取得元バッジから歌詞メニューを開く。
+// メニューは Lyrics ボタンにぶら下がっているので、その場で出すだけでよい。
+const openLyricsMenu = () => {
+  if (!ui.uploadMenu) return;
+  refreshCandidateMenu();
+  refreshLockMenu();
+  refreshLyricOffsetUi();
+  ui.uploadMenu.classList.add('visible');
+};
+
+// バッジは「⌄」を出している以上、押して開いたものは押して閉じられないと
+// おかしい。開いている時に押しても閉じないのは、外側クリックで閉じる係が
+// 捕捉段階(capture)で先に閉じ、その直後にここが開き直していたため。
+// 閉じる係の方でバッジを除外し、開け閉ては全部ここが持つ。
+const toggleLyricsMenu = () => {
+  if (!ui.uploadMenu) return;
+  if (ui.uploadMenu.classList.contains('visible')) {
+    ui.uploadMenu.classList.remove('visible');
+    hideCandidateHoverPreview();
+    return;
+  }
+  openLyricsMenu();
+};
+
+function updateLyricsSourceDebugBadge(payload) {
+  // この関数はテストで updateLyricsSourceState だけ切り出して実行されることがあり、
+  // その文脈には YTMLog も document も無い。存在確認してから触る。
+  if (typeof document === 'undefined' || !document.body) return;
+
+  if (typeof YTMLog !== 'undefined' && YTMLog.enabled) {
+    YTMLog.log('[CS] 歌詞ソース:', currentLyricsSource, payload?.sourceLabel || '');
+  }
+  // 取得元が分からない間は置かない
+  if (!currentLyricsSource && !config.showLyricsSource) {
+    document.getElementById('ytm-lyrics-source-debug')?.remove();
+    return;
+  }
+
+  let el = document.getElementById('ytm-lyrics-source-debug');
+  if (!el) {
+    el = createEl('div', 'ytm-lyrics-source-debug', '', '');
+    // 押せるものになったので、読み上げからも隠さない
+    el.setAttribute('role', 'button');
+    el.setAttribute('tabindex', '0');
+    el.title = '歌詞の取得元を切り替える / ズレを直す';
+    const open = (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      toggleLyricsMenu();
+    };
+    el.addEventListener('click', open);
+    el.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter' || ev.key === ' ') open(ev);
+    });
+    // ボタン列の真下に置く。押すと開くメニューもそこにぶら下がっているので、
+    // 見つける場所と操作する場所が揃う。画面の隅だと歌詞からも操作系からも
+    // 離れた孤立した位置になり、気づかれない。
+    // ボタン列がまだ無い時は body に置いて、下の CSS で隅に固定する。
+    if (ui.btnArea && ui.btnArea.parentNode) {
+      el.classList.add('ytm-source-inline');
+      ui.btnArea.insertAdjacentElement('afterend', el);
+    } else {
+      document.body.appendChild(el);
+    }
+  }
+  // 設定 ON の時だけ出しっぱなし。既定はマウスを動かした時だけ出す
+  el.classList.toggle('ytm-source-pinned', !!config.showLyricsSource);
+
+  if (!currentLyricsSource) {
+    el.textContent = '歌詞ソース: —';
+    return;
+  }
+
+  // sourceLabel は background が付ける実際に当たった経路名
+  // (例: 'LRCHub search' / 'LRCHub retry')。無ければ ID から引く。
+  const label = (typeof payload?.sourceLabel === 'string' && payload.sourceLabel.trim())
+    ? payload.sourceLabel.trim()
+    : (LYRICS_SOURCE_LABELS[currentLyricsSource] || currentLyricsSource);
+
+  let quality = 0;
+  try {
+    quality = selectLyricsPayload(payload).quality;
+  } catch (e) { /* 品質が読めなくても取得元は出す */ }
+  const qualityLabel = LYRICS_QUALITY_LABELS[quality] || '';
+
+  const parts = [label];
+  if (qualityLabel) parts.push(qualityLabel);
+  el.textContent = `歌詞ソース: ${parts.join(' / ')}`;
 }
 
 function updateLyricsSourceState(payload, notify = true) {
   currentLyricsSource = String(payload?.lyricsSource || payload?.source || '').trim().toLowerCase() || null;
-  isFallbackLyrics = !!payload?.fallbackUsed &&
-    currentLyricsSource === 'lrclib' &&
-    !!config.useLrcLibFallback &&
-    (config.lyricSourceMode || 'standard') === 'standard';
-
-  if (isFallbackLyrics && notify) showFallbackNotice();
-  else if (!isFallbackLyrics) hideFallbackNotice();
+  if (typeof updateLyricsSourceDebugBadge === 'function') {
+    updateLyricsSourceDebugBadge(payload);
+  }
 }
 
 const hasCharacterSyncedLines = (value) => (
@@ -1867,13 +2359,21 @@ const hasCharacterSyncedLines = (value) => (
 const selectLyricsPayload = (payload) => {
   const lyrics = typeof payload?.lyrics === 'string' ? payload.lyrics : '';
   const animatedLyrics = typeof payload?.animated_lyrics === 'string' ? payload.animated_lyrics : '';
-  const nextDynamicLines = hasCharacterSyncedLines(payload?.dynamicLines)
+  const availableDynamicLines = hasCharacterSyncedLines(payload?.dynamicLines)
     ? payload.dynamicLines
     : null;
-  const useAnimated = !nextDynamicLines && config.useAnimatedCaptions && animatedLyrics.trim();
-  const quality = nextDynamicLines
+  // 「アニメーション歌詞」は LRCHub の srv3 (animated_lyrics)。設定が ON の
+  // ときは同じレコードに DynamicLRC があっても srv3 を明示的に選ぶ。
+  const useAnimated = !!config.useAnimatedCaptions && !!animatedLyrics.trim();
+  const nextDynamicLines = useAnimated ? null : availableDynamicLines;
+  const mode = useAnimated
+    ? 'animated'
+    : (nextDynamicLines
+      ? 'dynamic'
+      : (/\[\d+:\d{2}(?:[.:]\d{1,3})?\]/.test(lyrics) ? 'synced' : (lyrics.trim() ? 'plain' : 'none')));
+  const quality = useAnimated
     ? 4
-    : (useAnimated
+    : (nextDynamicLines
       ? 3
       : (/\[\d+:\d{2}(?:[.:]\d{1,3})?\]/.test(lyrics) ? 2 : (lyrics.trim() ? 1 : 0)));
   return {
@@ -1881,26 +2381,37 @@ const selectLyricsPayload = (payload) => {
     lyrics,
     animatedLyrics,
     dynamicLines: nextDynamicLines,
+    mode,
     quality,
   };
 };
 
 async function applyLateLyricsUpgrade(payload) {
-  if (!payload || payload.lyricsSource !== 'lrchub' || !payload.success) return;
+  // 'ytm' も受ける。YouTube Music 側は時刻なしの歌詞を先に返しておいて、
+  // 裏で同期版を探し当てたらここで差し替えにくる。
+  // 差し替えてよいのはこの4つ。LrcLib は入れない。行同期止まりなので、
+  // 暫定表示を格上げする側ではなく常に格下げされる側だから。
+  // (配列をここに直書きしているのは、この関数がテストで単体切り出しされ、
+  //  外側の定数が存在しない文脈で実行されるため)
+  const lateSource = payload && payload.lyricsSource;
+  const upgradableSources = ['lrchub', 'ytm', 'simpmusic', 'lyricsplus'];
+  if (!payload || !upgradableSources.includes(lateSource) || !payload.success) return;
   if (!currentKey || payload.track_key !== currentKey) return;
   if (!activeLyricsRequestId || payload.request_id !== activeLyricsRequestId) return;
   if (payload.video_id && currentLyricsVideoId && payload.video_id !== currentLyricsVideoId) return;
   // A manual candidate choice is an explicit user decision; never replace it
   // with a request that started before that choice.
   if (selectedCandidateId || currentLyricsResultPriority >= 3) return;
-  // YTM優先で選ばれた歌詞は、ユーザーの明示的な選択と同じ扱い。
-  // 再生中に LRCHub が割り込んで差し替えるのを防ぐ。
-  // typeof で見ているのは、この関数がテストで単体切り出しされ、
-  // 外側の変数が存在しない文脈で実行されることがあるため。
-  if (typeof currentLyricsFromPreferredYtm !== 'undefined' && currentLyricsFromPreferredYtm) return;
-
   const selected = selectLyricsPayload(payload);
   if (!selected.text || !selected.text.trim()) return;
+  // YTM優先で選ばれた通常歌詞へ別ソースを割り込ませない。ただし設定で
+  // 要求された srv3 は通常の行同期とは異なる表示モードなので差し替える。
+  // typeof は、この関数を単体切り出しするテスト環境向け。
+  if (
+    typeof currentLyricsFromPreferredYtm !== 'undefined' &&
+    currentLyricsFromPreferredYtm &&
+    selected.mode !== 'animated'
+  ) return;
   if (currentLyricsResultPriority === 2 && selected.quality <= currentLyricsQuality) return;
   const requestId = activeLyricsRequestId;
   const targetKey = currentKey;
@@ -1966,7 +2477,7 @@ async function applyLateLyricsUpgrade(payload) {
           requests: lyricsRequests || null,
           config: lyricsConfig || null,
           lockState: lyricsLockState || null,
-          lyricsSource: 'lrchub',
+          lyricsSource: lateSource,
           fallbackUsed: false,
           lyricsQuality: selected.quality,
           offset_ms: Number.isFinite(Number(payload.offset_ms)) ? Number(payload.offset_ms) : 0,
@@ -2877,7 +3388,7 @@ async function applyTranslations(baseLines, youtubeUrl) {
             type: 'REGISTER_TRANSLATION',
             payload: { youtube_url: youtubeUrl, lang, lyrics: plain }
           }, (res) => {
-            console.log('[CS] REGISTER_TRANSLATION', lang, res);
+            YTMLog.log('[CS] REGISTER_TRANSLATION', lang, res);
           });
         }
       }
@@ -2985,6 +3496,791 @@ const buildAlignedTranslations = (baseLines, transLinesByLang) => {
   return alignedMap;
 };
 
+
+// ===================== Apple Music 風の文字同期 =====================
+// Apple Music の歌詞が美しく見えるのは、次が同時に起きているため:
+//   1. 塗りの先端が行を「ひと続きに」流れていく。境目はぼけている
+//   2. 歌い終わった語はわずかに持ち上がったまま残る
+//   3. 伸ばした音だけが膨らんで光り、また戻る。速い語は光らない
+//
+// ■ 描画の単位を「文字」ではなく「語」にしている理由
+//   1文字ずつ span に切って inline-block にすると、文字の間で字形の詰め
+//   (カーニング)が効かない。同じ英文で実測 3.3px 横に伸び、字の間が空く。
+//   語単位なら 1.4px まで縮む。さらに1文字ずつ独立に持ち上げ・拡大すると
+//   語がバラバラに動いてガタついて見える。
+//   日本語のように空白で切れない言語は1字ずつに切る。全角どうしは
+//   字形の詰めがほぼ効かないので、切っても隙間は出ない。
+//
+// ■ 塗りは行ぜんたいで1本の勾配として扱う
+//   語ごとに 0→1 の勾配を持たせると、語の変わり目でぼかしが途切れて
+//   境目が見える。そこで「行の先頭から何 px 進んだか」(--sweep)だけを
+//   毎フレーム1回書き、各語は自分の開始位置(--wx)を引いて自分の
+//   ところだけを描く。先端は語をまたいでひと続きに流れる。
+//
+// ■ 光と拡大は伸ばした音だけ
+//   全部の語を光らせると、行がのっぺり明るくなって「いま歌っている所」が
+//   分からなくなる。長さで強さを決め、短い語はほぼ素通しにする。
+//   曲線は applemusic-like-lyrics が Apple Music を参照して置いたものに合わせた。
+
+// 塗りの境目のぼかし半幅(文字サイズ基準)。ぼかしの幅はこの2倍。
+//
+// ここを広げすぎると、ぼかしが1文字まるごとを覆ってしまう。すると
+// 先端が字を「横切る」のではなく、字が丸ごとフェードインすることになり、
+// それが1文字ずつ順に起きて、かくんかくんと点いていくように見える。
+// 全角の字は 1em あるので、ぼかしの幅は 1em より狭くないといけない。
+// applemusic-like-lyrics は行の高さの半分(≒0.6em)を既定にしている。
+const WORD_FEATHER_EM = 0.3;
+// 伸ばした音がふくらむ時に持ち上がる量。歌い終わっても残さない。
+//
+// 以前は「歌い終わった語は持ち上がったまま残る」ようにしていたが、
+// これだと語ごとに高さが違う階段ができる。歌った語は上、まだの語は下、
+// その境目に段差が残るので、語と語の間に区切りがあるように見えてしまう。
+// Apple Music の行は平らで、流れているのは塗りだけ。
+// 動くのは伸ばした音だけにして、しかも元の高さへ戻す。
+const WORD_LIFT_EM = 0.05;
+// ふくらみの最短時間。速い語がパッと跳ねないようにする。
+const WORD_LIFT_MIN_SEC = 1.0;
+// 強調(拡大+光)の前倒し。声が当たる前から膨らみ始める。
+const WORD_EMPHASIS_PREROLL_SEC = 0.4;
+// 強調の全体の長さ。音の長さの 1.4 倍。
+const WORD_EMPHASIS_STRETCH = 1.4;
+// 次の語が無い時に1語へ割り当てる長さ
+const WORD_DEFAULT_SEC = 0.4;
+// 書き込みの量子化。粗いと長く伸ばす音で動きが飛び飛びになる。
+const WORD_STEP = 512;
+// 塗りの先端の px を刻む細かさ。粗いと、1フレームの進み幅が
+// 刻み幅に丸められて速度が数%ずつ揺れる。動いている間はどのみち
+// 毎フレーム書くので、細かくしても書き込み回数は増えない。
+const SWEEP_STEP = 32;
+
+// 端で微分が 0 になるので、増減の切り替わりで折れ線にならない
+const smoothstep = (x) => (x <= 0 ? 0 : (x >= 1 ? 1 : x * x * (3 - 2 * x)));
+// 両端が 0、中央が 1 の滑らかな山(ハン窓)。強調の立ち上がりと戻りに使う。
+const bellCurve = (x) => (x <= 0 || x >= 1 ? 0 : 0.5 - 0.5 * Math.cos(2 * Math.PI * x));
+
+// 音の長さ → 強調の強さ。短い音はほぼ素通し、伸ばすほど急に強くなって頭打ち。
+// 全部の語を光らせないのが肝。光らせると行がのっぺり明るくなり、
+// 「いま歌っている所」が読み取れなくなる。
+// 形は applemusic-like-lyrics のものに倣い、指数だけ緩めた。
+// あちらは 1 秒未満をほぼ完全に落とすが、それだと速い曲で
+// 一度も膨らまないまま終わってしまう。
+const emphasisCurve = (durSec, scale) => {
+  const x = durSec / scale;
+  return x > 1 ? Math.sqrt(x) : Math.pow(x, 1.8);
+};
+const emphasisScaleAmount = (durSec) => Math.min(1.2, emphasisCurve(durSec, 1.8) * 0.7);
+const emphasisGlowAmount = (durSec) => Math.min(0.7, emphasisCurve(durSec, 2.4) * 0.45);
+
+const isSpaceGlyph = (c) => c === ' ' || c === ' ' || c === '\t' || c === '　';
+
+// 日本語・中国語・韓国語は語の区切りに空白が無い。空白だけで切ると
+// 行まるごとが1単位になってしまい、光と持ち上げが行全体に一様に掛かる
+// (歌っている位置を光が追いかけなくなる)。
+//
+// かといって1字ずつ切ると、箱が字の数だけ増える。全角は字形の詰めが
+// ほぼ効かないので総幅は変わらないのだが、箱が増えるほど字の間の見え方が
+// 揃わなくなる。ブラウザの語区切りで切って、語の中はひと続きに組ませる。
+// 塗りの位置は行ぜんたいの --sweep が持っているので、単位が語に粗くなっても
+// 同期の細かさは落ちない。
+const lyricUnitSegmenter = (() => {
+  try {
+    if (typeof Intl !== 'undefined' && Intl.Segmenter) {
+      return new Intl.Segmenter('ja', { granularity: 'word' });
+    }
+  } catch (e) { /* 使えなければ下の簡易規則に落とす */ }
+  return null;
+})();
+
+// 語区切りが使えない環境用の保険。全角は1字ずつに切る。
+const CJK_GLYPH_RE = /[⺀-〾ぁ-㏿㐀-䶿一-鿿豈-﫿＀-ﾟ￠-￦가-힯]/;
+// 拗音・促音・長音・濁点や閉じ括弧は、単独では1拍にならない。
+// 前の字にぶら下げて「ちゃ」「きゅう」を一息で扱う。
+const CJK_TAIL_RE = /[ぁぃぅぇぉっゃゅょゎァィゥェォッャュョヮーｰ゛゜々〆、。，．！？!?)）」』】〕》〉”’]/;
+
+// dynamicLines の chars を「1文字 + 開始秒」の並びに均す。
+// chars は基本 1 文字ずつだが、プロバイダーによっては "Maybe " のような
+// 語の塊で来る。塊のままだと語の切れ目が取れないので、次の時刻までを
+// 文字数で割って配る。
+const flattenLyricGlyphs = (chars, lineEndSec) => {
+  const flat = [];
+  if (!Array.isArray(chars)) return flat;
+
+  const timeAt = (i) => {
+    const v = Number(chars[i]?.t);
+    return Number.isFinite(v) ? v / 1000 : null;
+  };
+
+  for (let i = 0; i < chars.length; i++) {
+    const raw = String(chars[i]?.c ?? '');
+    if (!raw) continue;
+    const start = timeAt(i);
+
+    let next = null;
+    for (let j = i + 1; j < chars.length; j++) {
+      const t = timeAt(j);
+      if (t !== null) { next = t; break; }
+    }
+    if (next === null) {
+      next = Number.isFinite(lineEndSec)
+        ? lineEndSec
+        : (start === null ? null : start + WORD_DEFAULT_SEC);
+    }
+
+    const glyphs = Array.from(raw);
+    const step = (start !== null && next !== null && next > start)
+      ? (next - start) / glyphs.length
+      : 0;
+    glyphs.forEach((g, k) => {
+      flat.push({ c: g, t: start === null ? null : start + step * k });
+    });
+  }
+  return flat;
+};
+
+// 空白で区切って語にまとめる。空白は語に含めず、素のテキストとして
+// 語と語の間に置く(inline-block の中に入れると折り返せなくなる)。
+const buildLyricWordUnits = (chars, lineEndSec) => {
+  const flat = flattenLyricGlyphs(chars, lineEndSec);
+
+  // ── 1文字ごとに空白を挟んだデータ ──────────────────────
+  // 日本語の同期データには、文字と文字の間すべてに空白を入れたものがある。
+  // 実測では、語タグの 83〜92% が空白で終わる曲が複数あった(滑らかに
+  // 見える曲は 20%)。
+  //
+  // これをそのまま語の区切りとして扱うと、全部の文字が独立した単位になる。
+  // 膨らみ・光・持ち上げは単位ごとに掛かって戻るので、1文字ずつ点いては
+  // 止まって見える。行の幅も倍近くになり、折り返しも増える。
+  //
+  // 前後がどちらも CJK の空白は、語の区切りではなく書式。語を切らせない。
+  // 英語のように本当に空白で語が分かれる言語は対象外(下の判定で外れる)。
+  const isFormattingSpace = new Array(flat.length).fill(false);
+  {
+    let spaces = 0;
+    let betweenCjk = 0;
+    for (let i = 0; i < flat.length; i++) {
+      if (!isSpaceGlyph(flat[i].c)) continue;
+      spaces += 1;
+      const prev = flat[i - 1];
+      const next = flat[i + 1];
+      if (prev && next && CJK_GLYPH_RE.test(prev.c) && CJK_GLYPH_RE.test(next.c)) {
+        isFormattingSpace[i] = true;
+        betweenCjk += 1;
+      }
+    }
+    // 半分を超えていなければ、ふつうに語を分けている空白とみなす
+    if (!spaces || betweenCjk / spaces <= 0.5) isFormattingSpace.fill(false);
+  }
+
+  // 語の頭になる位置を先に出す。Intl の語区切りは英語も日本語も
+  // 同じ呼び方で扱えるので、言語で分岐しない。
+  // 書式の空白を外した文字列で切ることで、本来の語のまとまりが出る。
+  const boundaries = new Set();
+  if (flat.length && lyricUnitSegmenter) {
+    try {
+      let text = '';
+      const flatIndexAt = new Map();
+      for (let i = 0; i < flat.length; i++) {
+        if (isFormattingSpace[i]) continue;
+        flatIndexAt.set(text.length, i);
+        text += flat[i].c;
+      }
+      for (const seg of lyricUnitSegmenter.segment(text)) {
+        const index = flatIndexAt.get(seg.index);
+        if (index !== undefined) boundaries.add(index);
+      }
+    } catch (e) { /* 落ちたら下の簡易規則へ */ }
+  }
+  const useSegmenter = boundaries.size > 0;
+
+  const units = [];
+  let current = null;
+  let currentIsCjk = false;
+
+  flat.forEach((glyph, index) => {
+    if (isSpaceGlyph(glyph.c)) {
+      // 書式の空白は歌詞の一部ではないので、まるごと捨てる。
+      //
+      // 残すと二つの困りごとが出る。ひとつは単純に、字と字の間が
+      // 空いて見えること。もうひとつは塗りの速さで、こちらの方が重い。
+      // データは「<時刻>文字+空白」で区切られているため、区間の時間が
+      // 文字と空白で等分される。つまり塗りは各区間の半分を、目に見えない
+      // 空白の上で使う。文字の上だけ倍速で通り、空白の上で止まって見える。
+      //
+      // 捨てれば、その文字が区間の時間をまるごと使う。速さが揃う。
+      if (isFormattingSpace[index]) return;
+      const last = units[units.length - 1];
+      if (last && last.type === 'space') last.text += glyph.c;
+      else units.push({ type: 'space', text: glyph.c });
+      current = null;
+      return;
+    }
+
+    const isTail = CJK_TAIL_RE.test(glyph.c);
+    let needsNewUnit;
+    if (useSegmenter) {
+      // 拗音・長音は語区切りに関わらず前へぶら下げる
+      needsNewUnit = !current || (!isTail && boundaries.has(index));
+    } else {
+      const isCjk = CJK_GLYPH_RE.test(glyph.c);
+      needsNewUnit = !current || (!isTail && (isCjk || currentIsCjk));
+      if (needsNewUnit) currentIsCjk = isCjk;
+    }
+
+    if (needsNewUnit) {
+      current = { type: 'word', text: '', times: [], offsets: [], endIndex: index };
+      units.push(current);
+    }
+    current.offsets.push(current.text.length);
+    current.text += glyph.c;
+    current.times.push(glyph.t);
+    current.endIndex = index;
+  });
+
+  // 各語の終わりは「その語の最後の文字の次に来るもの」の時刻。
+  // 次の語の頭を使うと、語と語の間の無音ぶんまで塗りが伸びてしまう。
+  for (const unit of units) {
+    if (unit.type !== 'word') continue;
+    let end = null;
+    for (let i = unit.endIndex + 1; i < flat.length; i++) {
+      // 捨てた書式空白の時刻は拾わない。データは「文字+空白」で1区間
+      // なので、空白は区間の中点の時刻を持つ。これを語の終わりにすると、
+      // そこから次の語の頭(区間の終わり)まで、進む px がゼロの区間が
+      // できる。buildMonotoneTangents は進みがゼロの区間を見つけると
+      // その両端の接線を 0 にするので、塗りが文字ごとに完全に止まる。
+      // 実測では行の時間の 24〜29% が停止だった(滑らかな曲は 0%)。
+      if (isFormattingSpace[i]) continue;
+      if (flat[i].t !== null) { end = flat[i].t; break; }
+    }
+    const start = unit.times.find(t => t !== null) ?? null;
+    if (end === null) end = Number.isFinite(lineEndSec) ? lineEndSec : null;
+    unit.start = start;
+    unit.end = (end !== null && start !== null && end > start)
+      ? end
+      : (start === null ? null : start + WORD_DEFAULT_SEC);
+  }
+
+  return units;
+};
+
+// ── 行ぜんたいの「時刻 → 進んだ px」表を作る ────────────────
+// 語の横位置(offsetLeft)は変形の影響を受けない素の値。語の中の文字境界は
+// Range で測る。こちらは変形が乗るが、使うのは語の中での比だけなので影響しない。
+// 折り返した行では、2行目以降の語を1行目の右へ continue させた座標に直す
+// (読む順に一本の帯として扱うため)。
+const measureLyricLineSweep = (row) => {
+  // PIP は別ウィンドウ・別文書。Range も getComputedStyle も
+  // その文書のものを使わないと、取れる値が別の窓のものになる。
+  const doc = row.ownerDocument || (typeof document !== 'undefined' ? document : null);
+  const view = (doc && doc.defaultView) || (typeof window !== 'undefined' ? window : null);
+  const spans = row._ytmWordSpans;
+  if (!doc) {
+    row._sweepReady = true;
+    return;
+  }
+  if (!Array.isArray(spans) || !spans.length) {
+    row._sweepReady = true;
+    return;
+  }
+  // 歌詞パネルを開く前など、まだ場所を持っていない時に測ると
+  // 全部 0 になる。済んだ印を付けずに帰って、あとで測り直させる。
+  if (!row.offsetWidth && !row.offsetHeight) return;
+  row._sweepReady = true;
+
+  try {
+    // 1. 語を表示上の行ごとにまとめ、行の幅を出す
+    const rowsByTop = new Map();
+    for (const span of spans) {
+      const top = span.offsetTop;
+      let bucket = rowsByTop.get(top);
+      if (!bucket) rowsByTop.set(top, (bucket = { right: 0 }));
+      bucket.right = Math.max(bucket.right, span.offsetLeft + span.offsetWidth);
+    }
+    const tops = Array.from(rowsByTop.keys()).sort((a, b) => a - b);
+    let carry = 0;
+    for (const top of tops) {
+      rowsByTop.get(top).origin = carry;
+      carry += rowsByTop.get(top).right;
+    }
+
+    // 2. 語の開始位置を CSS 変数として渡し、文字ごとの位置表を作る
+    const times = [];
+    const xs = [];
+    const range = doc.createRange();
+
+    for (const span of spans) {
+      const origin = rowsByTop.get(span.offsetTop)?.origin || 0;
+      const wordX = origin + span.offsetLeft;
+      const width = span.offsetWidth;
+      span._wx = wordX;
+      span.style.setProperty('--wx', String(wordX));
+
+      const node = span.firstChild;
+      const offsets = span._offsets;
+      let fractions = null;
+      if (node && node.nodeType === 3 && Array.isArray(offsets) && offsets.length > 1) {
+        const len = node.data.length;
+        const raw = [];
+        for (const offset of offsets) {
+          range.setStart(node, 0);
+          range.setEnd(node, Math.min(offset, len));
+          raw.push(range.getBoundingClientRect().width);
+        }
+        const last = (() => {
+          range.setStart(node, 0);
+          range.setEnd(node, len);
+          return range.getBoundingClientRect().width;
+        })();
+        if (last > 0) fractions = raw.map(w => w / last);
+      }
+
+      span._times.forEach((t, i) => {
+        if (t === null) return;
+        const frac = fractions ? (fractions[i] ?? (i / span._times.length)) : (i / span._times.length);
+        times.push(t);
+        xs.push(wordX + width * frac);
+      });
+
+      // 語の終わりも節目として入れる。入れないと最後の文字が
+      // 語の右端まで塗り切るタイミングを表せない。
+      if (Number.isFinite(span._end)) {
+        times.push(span._end);
+        xs.push(wordX + width);
+      }
+    }
+
+    // 3. 時刻で並べ、単調にする(同時刻の重複はあとの方を残す)
+    const order = times.map((t, i) => i).sort((a, b) => times[a] - times[b] || xs[a] - xs[b]);
+    const st = [];
+    const sx = [];
+    for (const i of order) {
+      if (st.length && times[i] <= st[st.length - 1]) {
+        sx[sx.length - 1] = Math.max(sx[sx.length - 1], xs[i]);
+        continue;
+      }
+      st.push(times[i]);
+      sx.push(Math.max(xs[i], sx.length ? sx[sx.length - 1] : 0));
+    }
+    row._sweepT = st;
+    row._sweepX = sx;
+    row._sweepM = buildMonotoneTangents(st, sx);
+    row._sweepEnd = carry;
+    row._sweepIndex = 0;
+
+    // 4. ぼかし半幅は文字サイズ基準の px。行に一度だけ置く。
+    const fontPx = (view ? parseFloat(view.getComputedStyle(row).fontSize) : NaN) || 32;
+    row.style.setProperty('--feather', (WORD_FEATHER_EM * fontPx).toFixed(1));
+
+    // 5. 語ごとの強調の強さ。長さで決まるので毎フレーム計算しない。
+    for (const span of spans) {
+      const dur = (Number.isFinite(span._end) && Number.isFinite(span._start) && span._end > span._start)
+        ? span._end - span._start
+        : WORD_DEFAULT_SEC;
+      const scaleAmount = emphasisScaleAmount(dur);
+      const glowAmount = emphasisGlowAmount(dur);
+      // ここが小さい語は、膨らみも光も目に見えない。前倒しの窓を
+      // 広げて毎フレーム --wg を書くだけ無駄になるので外す。
+      // この閾値だと 0.4 秒より短い語は素通しになる。
+      span._emp = scaleAmount > 0.05 || glowAmount > 0.05;
+      span._empStart = span._start - WORD_EMPHASIS_PREROLL_SEC;
+      span._empDur = Math.max(WORD_LIFT_MIN_SEC, dur) * WORD_EMPHASIS_STRETCH;
+      span._amp = scaleAmount;
+      // 光は持ち上がりと分ける。持ち上がりは合成側のキーフレームなので
+      // 毎フレームの費用が無いが、光は --wg をメインスレッドから毎フレーム
+      // 書き、text-shadow を描き直させる。軽量モードで落とすのはこちらだけ。
+      // typeof で見ているのは、この関数がテストで単体切り出しされ、
+      // 外側の config が存在しない文脈で実行されることがあるため。
+      // ここで例外を出すと上の try/catch に落ちて塗りの表ごと消える。
+      span._glow = span._emp &&
+        !(typeof config !== 'undefined' && config && config.lowCpuMode);
+      if (span._glow) {
+        span.style.setProperty('--wglowa', glowAmount.toFixed(3));
+        // 光の半径は語ごとに固定。半径を毎フレーム変えると、そのたびに
+        // 字の影を描き直すことになって重い。動かすのは濃さだけ。
+        span.style.setProperty('--wglowr', Math.min(0.3, glowAmount * 0.3).toFixed(3));
+      }
+    }
+  } catch (e) {
+    row._sweepT = null;
+    row._sweepX = null;
+  }
+};
+
+// ── 塗りの先端をなめらかに動かす ──────────────────────────
+// 節目(文字の開始時刻とその横位置)の間を直線で結ぶと、節目ごとに
+// 速度が段で変わる。文字は幅がまちまちなのに時間はほぼ等分なので、
+// 細い字は速く、太い字は遅く進む。これが「カクカク」の見え方になる。
+//
+// 節目は必ず通しつつ、間を3次で結んで速度を連続にする。
+// 接線は Fritsch-Carlson の重み付き調和平均で、単調性が壊れない
+// (行き過ぎて戻る、が起きない)ものを選ぶ。
+const buildMonotoneTangents = (ts, xs) => {
+  const n = ts.length;
+  const m = new Array(n).fill(0);
+  if (n < 2) return m;
+
+  const h = new Array(n - 1);
+  const d = new Array(n - 1);
+  for (let i = 0; i < n - 1; i++) {
+    h[i] = ts[i + 1] - ts[i];
+    d[i] = h[i] > 0 ? (xs[i + 1] - xs[i]) / h[i] : 0;
+  }
+
+  m[0] = d[0];
+  m[n - 1] = d[n - 2];
+  for (let i = 1; i < n - 1; i++) {
+    if (d[i - 1] === 0 || d[i] === 0 || (d[i - 1] < 0) !== (d[i] < 0)) {
+      m[i] = 0;
+      continue;
+    }
+    const w1 = 2 * h[i] + h[i - 1];
+    const w2 = h[i] + 2 * h[i - 1];
+    m[i] = (w1 + w2) / (w1 / d[i - 1] + w2 / d[i]);
+  }
+  return m;
+};
+
+// 時刻 → 行の先頭から進んだ px
+const lyricSweepAt = (row, t) => {
+  const st = row._sweepT;
+  const sx = row._sweepX;
+  if (!st || st.length === 0) return 0;
+  if (t <= st[0]) return 0;
+  if (t >= st[st.length - 1]) return row._sweepEnd || sx[sx.length - 1];
+
+  // 再生は基本前進する。前フレームの位置から続け、巻き戻った時だけ探し直す。
+  let i = row._sweepIndex || 0;
+  if (i >= st.length - 1) i = st.length - 2;
+  if (t < st[i]) i = 0;
+  while (i + 1 < st.length - 1 && t >= st[i + 1]) i++;
+  row._sweepIndex = i;
+
+  const t0 = st[i];
+  const t1 = st[i + 1];
+  const x0 = sx[i];
+  const x1 = sx[i + 1];
+  if (!(t1 > t0)) return x1;
+
+  const h = t1 - t0;
+  const u = (t - t0) / h;
+  const sm = row._sweepM;
+  if (!sm) return x0 + (x1 - x0) * u;
+
+  // Hermite。節目では必ず x0 / x1 を通るので、声とのずれは増えない。
+  const u2 = u * u;
+  const u3 = u2 * u;
+  return (2 * u3 - 3 * u2 + 1) * x0
+    + (u3 - 2 * u2 + u) * h * sm[i]
+    + (-2 * u3 + 3 * u2) * x1
+    + (u3 - u2) * h * sm[i + 1];
+};
+
+// ── 文字の動き(持ち上がり・膨らみ) ────────────────────────
+// 動きだけは毎フレーム JS で transform を書いてはいけない。
+// Chrome はテキストの縦位置を整数ピクセルに丸める(横は小数対応、縦は非対応)。
+// 持ち上がりは 0.05em = 32px なら 1.6px しかないので、丸められると
+// 1〜2回のジャンプになる。これがカクカクの正体だった。
+//
+// キーフレームを先に作って Web Animations に渡すと、合成側で小数のまま
+// 動かしてくれる。文字は一度だけ描かれ、あとは GPU が変形するだけになる。
+// 時計合わせは行ごとに1回。ずれた時(シーク・一時停止)だけ直す。
+//
+// 塗り(--sweep)と光(--wg)は位置を動かさないので丸めの問題が無く、
+// 毎フレーム書いたままで良い。合成できないプロパティなので、
+// 同じアニメーションに混ぜると transform まで合成から外れてしまう。
+
+// キーフレームの粗さ。間はブラウザが直線で埋めるので、
+// 40ms も刻めば 0.05em の移動では差が見えない。
+const MOTION_FRAME_MS = 40;
+const MOTION_MIN_FRAMES = 8;
+const MOTION_MAX_FRAMES = 40;
+
+const MOTION_RESYNC_SEC = 0.08;
+
+// 動きを持っている行。一時停止の時にまとめて止めるために覚えておく。
+const _lyricMotionRows = new Set();
+
+// 動くのは伸ばした音だけ。ふくらんで、元の高さと大きさへ戻る。
+const buildLyricWordKeyframes = (span, origin) => {
+  const from = span._empStart;
+  const dur = span._empDur;
+  if (!Number.isFinite(from) || !(dur > 0)) return null;
+
+  const amp = span._amp || 0;
+  const count = Math.max(
+    MOTION_MIN_FRAMES,
+    Math.min(MOTION_MAX_FRAMES, Math.round((dur * 1000) / MOTION_FRAME_MS)),
+  );
+
+  const frames = [];
+  for (let i = 0; i <= count; i++) {
+    const env = bellCurve(i / count);
+    frames.push({
+      offset: i / count,
+      transform: `translateY(${(-WORD_LIFT_EM * env).toFixed(4)}em)`
+        + ` scale(${(1 + env * amp * 0.085).toFixed(4)})`,
+    });
+  }
+
+  return { frames, delay: (from - origin) * 1000, duration: dur * 1000 };
+};
+
+// 塗りの先端もキーフレームで渡す。節目(文字ごとの時刻と横位置)を
+// そのままキーフレームにして、区間ごとに緩急を付ける。
+// 3次エルミートは3次ベジェとまったく同じ形に書き直せるので、
+// 前に入れた滑らかな曲線を1つも崩さずにブラウザへ渡せる。
+// 節目の数だけで済むので、細かく刻んでキーフレームを量産しなくてよい。
+const buildLyricSweepKeyframes = (row) => {
+  const ts = row._sweepT;
+  const xs = row._sweepX;
+  const ms = row._sweepM;
+  if (!ts || ts.length < 2) return null;
+
+  const from = ts[0];
+  const total = ts[ts.length - 1] - from;
+  if (!(total > 0)) return null;
+
+  const frames = [];
+  for (let i = 0; i < ts.length; i++) {
+    const offset = (ts[i] - from) / total;
+    if (frames.length && offset <= frames[frames.length - 1].offset) continue;
+    const frame = { offset: Math.min(1, Math.max(0, offset)), '--sweep': xs[i].toFixed(2) };
+
+    if (i < ts.length - 1 && ms) {
+      const h = ts[i + 1] - ts[i];
+      const dx = xs[i + 1] - xs[i];
+      if (h > 0 && dx > 0) {
+        // エルミート → ベジェ。制御点の x は 1/3, 2/3 で固定になる。
+        const y1 = Math.min(1, Math.max(0, (ms[i] * h) / (3 * dx)));
+        const y2 = Math.min(1, Math.max(0, 1 - (ms[i + 1] * h) / (3 * dx)));
+        frame.easing = `cubic-bezier(0.3333, ${y1.toFixed(4)}, 0.6667, ${y2.toFixed(4)})`;
+      } else {
+        frame.easing = 'linear';
+      }
+    }
+    frames.push(frame);
+  }
+
+  if (frames.length < 2) return null;
+  frames[0].offset = 0;
+  frames[frames.length - 1].offset = 1;
+  return { frames, from, duration: total * 1000 };
+};
+
+const createLyricWordMotion = (row) => {
+  row._motionReady = true;
+  const spans = row._ytmWordSpans;
+  if (!spans || !spans.length) return;
+  if (typeof spans[0].animate !== 'function') return;   // 使えない環境では動かさない
+
+  const origin = spans.map(sp => sp._start).find(v => Number.isFinite(v));
+  if (!Number.isFinite(origin)) return;
+  row._motionOrigin = origin;
+
+  const animations = [];
+
+  // 塗り。行に1本だけ。
+  const sweep = buildLyricSweepKeyframes(row);
+  if (sweep && typeof row.animate === 'function') {
+    try {
+      const animation = row.animate(sweep.frames, {
+        duration: sweep.duration,
+        delay: (sweep.from - origin) * 1000,
+        fill: 'both',
+        easing: 'linear',   // 緩急はキーフレームごとに付けてある
+      });
+      animation.pause();
+      animations.push(animation);
+      row._sweepAnimated = true;
+    } catch (e) {
+      row._sweepAnimated = false;
+    }
+  }
+
+  for (const span of spans) {
+    // 速い語はまったく動かさない。動かすとその語だけ高さがずれて、
+    // 語と語の間に段差ができる。
+    if (!span._emp || !Number.isFinite(span._start)) continue;
+    const built = buildLyricWordKeyframes(span, origin);
+    if (!built) continue;
+    const { frames, delay, duration } = built;
+    try {
+      const animation = span.animate(frames, {
+        duration,
+        delay,
+        fill: 'both',
+        easing: 'linear',   // 形はキーフレームに焼いてある
+      });
+      animation.pause();
+      animations.push(animation);
+    } catch (e) { /* 作れなくても塗りは動く */ }
+  }
+  row._motions = animations;
+  if (animations.length) _lyricMotionRows.add(row);
+};
+
+const syncLyricWordMotion = (row, t, rate) => {
+  const motions = row._motions;
+  if (!motions || !motions.length) return;
+  const local = (t - row._motionOrigin) * 1000;
+  const now = performance.now();
+
+  // 合わせ直しの要否は、アニメーション側の currentTime ではなく
+  // 自前の記録で判断する。語ごとに長さが違うので、終わったものは
+  // それぞれ別の時刻で止まってしまい、比較の相手にならない。
+  //
+  // 前回合わせた時から実時間ぶん進んだはずの位置と、曲の位置がずれて
+  // いたら、シークか一時停止があったということ。
+  if (row._motionSyncedAt !== undefined) {
+    const predicted = row._motionSyncedLocal + (now - row._motionSyncedAt) * rate;
+    if (Math.abs(predicted - local) <= MOTION_RESYNC_SEC * 1000) return;
+  }
+
+  for (const animation of motions) {
+    try {
+      animation.currentTime = local;
+      if (animation.playbackRate !== rate) animation.playbackRate = rate;
+      animation.play();
+    } catch (e) { /* 破棄済み */ }
+  }
+  row._motionSyncedLocal = local;
+  row._motionSyncedAt = now;
+};
+
+const stopLyricWordMotion = (row) => {
+  const motions = row._motions;
+  if (!motions) return;
+  row._motionSyncedAt = undefined;
+  for (const animation of motions) {
+    try { animation.pause(); animation.currentTime = 0; } catch (e) { /* 破棄済み */ }
+  }
+};
+
+// 一時停止でループが止まる時。走らせたままだと歌詞だけ動き続ける。
+const pauseAllLyricWordMotion = () => {
+  for (const row of _lyricMotionRows) {
+    const motions = row._motions;
+    if (!motions) continue;
+    // 次に描く時、実時間とのずれで合わせ直される
+    row._motionSyncedAt = undefined;
+    for (const animation of motions) {
+      try { if (animation.playState === 'running') animation.pause(); } catch (e) { /* 破棄済み */ }
+    }
+  }
+};
+
+const writeLyricVar = (el, key, cacheKey, value, step) => {
+  const q = Math.round(value * step) / step;
+  if (el[cacheKey] === q) return;
+  el[cacheKey] = q;
+  el.style.setProperty(key, String(q));
+};
+
+// PIP へは innerHTML で複製するので、span に持たせた JS のプロパティは
+// 消える。data 属性に書いておいた時刻から組み直す。
+const rehydrateLyricWordRow = (row) => {
+  row._ytmRehydrated = true;
+  const spans = Array.from(row.querySelectorAll('.lyric-word'));
+  if (!spans.length) return null;
+
+  for (const span of spans) {
+    const times = String(span.dataset.wt || '')
+      .split(',')
+      .map(v => (v === '' ? null : Number(v)))
+      .map(v => (v !== null && Number.isFinite(v) ? v : null));
+    const glyphs = Array.from(span.textContent || '');
+    const offsets = [];
+    let at = 0;
+    for (const g of glyphs) {
+      offsets.push(at);
+      at += g.length;
+    }
+    span._times = times.length ? times : [null];
+    span._offsets = offsets;
+    span._start = times.find(v => v !== null) ?? null;
+    const end = Number(span.dataset.we);
+    span._end = Number.isFinite(end) ? end : null;
+    span._emp = false;
+  }
+
+  row._ytmWordSpans = spans;
+  return spans;
+};
+
+const paintLyricWordRow = (row, t, rate = 1) => {
+  let spans = row._ytmWordSpans;
+  if (!spans && !row._ytmRehydrated) spans = rehydrateLyricWordRow(row);
+  if (!spans || !spans.length) return;
+  if (!row._sweepReady) measureLyricLineSweep(row);
+
+  // 持ち上がりと膨らみは合成側に任せる。ここで transform を毎フレーム
+  // 書くと、縦位置が整数ピクセルに丸められて 1〜2 回のジャンプになる。
+  if (!row._motionReady) createLyricWordMotion(row);
+  syncLyricWordMotion(row, t, rate);
+
+  // 塗りもキーフレームで渡してある。渡せなかった時だけ自分で書く。
+  if (!row._sweepAnimated) {
+    writeLyricVar(row, '--sweep', '_sweep', lyricSweepAt(row, t), SWEEP_STEP);
+  }
+
+  // 光は位置を動かさないので丸めの問題が無い。合成できないプロパティ
+  // なので、動きと同じアニメーションに混ぜると transform まで
+  // 合成から外れてしまう。こちらは毎フレーム書く。
+  for (let i = 0; i < spans.length; i++) {
+    const span = spans[i];
+    if (!span._glow || !Number.isFinite(span._start)) continue;
+    const env = bellCurve((t - span._empStart) / span._empDur);
+    writeLyricVar(span, '--wg', '_wg', env, WORD_STEP);
+  }
+};
+
+// 計測は offsetLeft などを読むので、その場でレイアウトを1回確定させる。
+// 行が主役になった瞬間にやると、ちょうど自動スクロールが走り出す所と
+// 重なって一瞬つっかえる。描画が済んだ直後に、少しずつ先に済ませておく。
+const prefetchLyricLineSweeps = (rows) => {
+  const pending = rows.filter(r => r && !r._sweepReady);
+  if (!pending.length) return;
+  let index = 0;
+  const step = () => {
+    // 1フレームに詰め込みすぎると、そのフレームだけ伸びる
+    const end = Math.min(index + 8, pending.length);
+    for (; index < end; index++) {
+      const row = pending[index];
+      if (!row.isConnected || !row.offsetWidth) continue;
+      // 複製されてきた行は語の情報を持っていないので、まず組み直す
+      if (!row._ytmWordSpans && !row._ytmRehydrated) rehydrateLyricWordRow(row);
+      if (!row._ytmWordSpans) continue;
+      measureLyricLineSweep(row);
+    }
+    if (index < pending.length) requestAnimationFrame(step);
+  };
+  requestAnimationFrame(step);
+};
+
+// 窓の幅や UI サイズが変わると語の横位置が動く。測り直さないと
+// 塗りの位置が字とずれたままになる。
+const invalidateLyricLineSweeps = () => {
+  for (const container of [ui.lyrics, PipManager.pipLyricsContainer]) {
+    if (!container) continue;
+    container.querySelectorAll('.lyric-line.ytm-word-sync')
+      .forEach(row => { row._sweepReady = false; });
+  }
+};
+
+const resetLyricWordRow = (row) => {
+  const spans = row._ytmWordSpans;
+  if (!spans || !spans.length) return;
+  stopLyricWordMotion(row);
+  if (!row._sweepAnimated) writeLyricVar(row, '--sweep', '_sweep', 0, SWEEP_STEP);
+  row._sweepIndex = 0;
+  for (let i = 0; i < spans.length; i++) {
+    if (spans[i]._emp) writeLyricVar(spans[i], '--wg', '_wg', 0, WORD_STEP);
+  }
+};
+
+// ── 従来式(1文字ずつ点灯)の表示 ──────────────────────────
+// Apple Music 風を切った時と、低負荷モードの時に使う。
+// 次の文字が無い(行末)ときに1文字へ割り当てる長さ
+const CHAR_DEFAULT_SPAN_SEC = 0.35;
 
 // ===================== Dynamic line post-processing =====================
 // Some providers return Dynamic lyrics in "word chunks" (e.g. each char item is a whole word).
@@ -3109,6 +4405,70 @@ function normalizeDynamicLinesToCharLevel(dynLines) {
   return dynLines;
 }
 
+// ── 行の終わり時刻を持たないデータの補完 ──────────────────
+// 終わり時刻が無い時、これまでは一律「最後の文字 + 0.2 秒」を行の終わりに
+// していた。伸ばして歌っている最後の音が0.2秒で塗り終わってしまい、
+// 間奏に入る行ほど不自然に見える。かといって次の行頭まで伸ばすと、
+// 間奏の長さぶん塗り続けることになる。行と行の間の空きは無音であって、
+// そのぶん歌が伸びているわけではない。
+//
+// その行自身の文字の進み方から1文字ぶんの長さを見積もり、
+// 次の行に食い込まない範囲に収める。
+const DYNAMIC_TAIL_MIN_MS = 200;
+const DYNAMIC_TAIL_MAX_MS = 900;
+const DYNAMIC_TAIL_GUARD_MS = 50;
+
+const dynamicLineCharTimes = (line) => (
+  (Array.isArray(line?.chars) ? line.chars : [])
+    .map(char => (typeof char?.t === 'number' && Number.isFinite(char.t) ? char.t : null))
+    .filter(t => t !== null)
+    .sort((a, b) => a - b)
+);
+
+const fillDynamicLineEnds = (lines) => {
+  if (!Array.isArray(lines)) return lines;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (!line || typeof line !== 'object') continue;
+    // もともと終わりを持っているデータには触らない
+    const declared = [line.endTimeMs, line.end_ms, line.endMs, line.endTime]
+      .map(v => Number(v))
+      .find(v => Number.isFinite(v));
+    if (Number.isFinite(declared)) continue;
+
+    const times = dynamicLineCharTimes(line);
+    if (times.length < 2) continue;
+    const last = times[times.length - 1];
+
+    const gaps = [];
+    for (let k = 1; k < times.length; k++) {
+      if (times[k] > times[k - 1]) gaps.push(times[k] - times[k - 1]);
+    }
+    if (!gaps.length) continue;
+    gaps.sort((a, b) => a - b);
+    // 中央値なので、行の中に伸ばした音が1つあっても引きずられない
+    const typical = gaps[Math.floor(gaps.length / 2)];
+
+    let tail = Math.min(DYNAMIC_TAIL_MAX_MS, Math.max(DYNAMIC_TAIL_MIN_MS, typical));
+
+    const nextTimes = dynamicLineCharTimes(lines[i + 1]);
+    const nextStart = nextTimes.length ? nextTimes[0] : null;
+    if (typeof nextStart === 'number') {
+      // 隙間より下限を優先すると次の行に食い込む。空きが無い行は触らない。
+      const room = nextStart - last - DYNAMIC_TAIL_GUARD_MS;
+      if (room <= 0) continue;
+      tail = Math.min(tail, room);
+    }
+
+    line.endTimeMs = last + tail;
+    // getDynamicLineEndSec がキャッシュしているので落としておく
+    if (typeof line.__ytmEndSec === 'number') delete line.__ytmEndSec;
+  }
+
+  return lines;
+};
+
 async function applyLyricsText(rawLyrics) {
   const keyAtStart = currentKey;
   const videoIdAtStart = currentLyricsVideoId;
@@ -3131,14 +4491,19 @@ async function applyLyricsText(rawLyrics) {
       const canonicalSingerLines = canonicalLyrics.trim()
         ? parseLRCInternal(canonicalLyrics).lines
         : [];
-      const useSingerLayout = hasSingerDisplayMetadata(currentSingerMetadata, canonicalSingerLines);
-      if (
-        useSingerLayout &&
-        canonicalLyrics.trim() && canonicalLyrics.trim() !== rawLyrics.trim()
-      ) {
-        return applyLyricsText(canonicalLyrics);
-      }
-      lyricsData = timedTextData.plainLines || [];
+      // 歌手メタデータはsrv3とは別APIから遅れて到着する。以前はその時点で
+      // canonical LRCへ描画を切り替えていたため、Animated TimedTextが一瞬だけ
+      // 表示されて通常歌詞へ戻っていた。自由配置のsrv3を表示ソースとして維持し、
+      // 行メタデータだけをplainLinesへ対応付ける。
+      lyricsData = applySingerMetadataToLines(
+        timedTextData.plainLines || [],
+        currentSingerMetadata,
+        {
+          canonicalLines: canonicalSingerLines,
+          sameSource: !canonicalLyrics.trim() || canonicalLyrics.trim() === rawLyrics.trim(),
+        }
+      );
+      timedTextData.plainLines = lyricsData;
       dynamicLines = null;
       duetSubDynamicLines = null;
       renderAnimatedTimedText(timedTextData);
@@ -3154,6 +4519,10 @@ async function applyLyricsText(rawLyrics) {
     animatedCaptionData = null;
     parsed = parseBaseLRC(rawLyrics);
   }
+  // 歌手メタデータの照合はパース直後の行番号を前提にしているので、
+  // 見出し行を落とす前の並びを別に取っておく。
+  const parsedWithHeaders = parsed;
+  parsed = stripLeadingHeaderLines(parsed, String(keyAtStart || '').split('///')[0]);
   const videoUrl = getCurrentVideoUrl();
 
   // duet: if sub.txt exists, hide (filter) the normal lines that match sub timestamps,
@@ -3195,7 +4564,7 @@ async function applyLyricsText(rawLyrics) {
   const canonicalLyrics = String(currentSingerCanonicalLyrics || '');
   const canonicalLines = canonicalLyrics.trim()
     ? parseLRCInternal(canonicalLyrics).lines
-    : parsed;
+    : parsedWithHeaders;
   finalLines = applySingerMetadataToLines(finalLines, currentSingerMetadata, {
     canonicalLines,
     sameSource: !canonicalLyrics.trim() || canonicalLyrics.trim() === rawLyrics.trim(),
@@ -3206,6 +4575,7 @@ async function applyLyricsText(rawLyrics) {
   try {
     if (Array.isArray(dynamicLines) && dynamicLines.length) {
       dynamicLines = normalizeDynamicLinesToCharLevel(dynamicLines);
+      dynamicLines = fillDynamicLineEnds(dynamicLines);
     }
   } catch (e) { }
 
@@ -3228,6 +4598,68 @@ const getCandidateId = (cand, idx = 0) => {
   return String(cand.id || cand.candidate_id || cand.path || cand.file || cand.filename || cand.name || cand.title || idx);
 };
 
+// 取得元をまたいだ候補の合流。「足す」だけで、今出ている候補や
+// 選択状態には触らない。追加できた件数を返す。
+const mergeLyricsCandidates = (incoming) => {
+  if (!Array.isArray(incoming) || !incoming.length) return 0;
+  const merged = Array.isArray(lyricsCandidates) ? lyricsCandidates.slice() : [];
+  const knownIds = new Set(merged.map((cand, idx) => getCandidateId(cand, idx)));
+  let added = 0;
+  incoming.forEach(cand => {
+    const id = cand && cand.id ? String(cand.id) : '';
+    if (!id || knownIds.has(id)) return;
+    knownIds.add(id);
+    merged.push(cand);
+    added += 1;
+  });
+  if (added) lyricsCandidates = merged;
+  return added;
+};
+
+// YouTube Music は background を通らない(Service Worker の fetch は
+// Origin: chrome-extension:// が付いて 403 で弾かれるため、content script が
+// 直接叩いている)。そのぶん background が組む候補一覧にも入らないので、
+// ここで他の取得元と同じ形に均して合流させる。
+// これが無いと、取得だけして捨てているのにメニューには出てこない、という
+// 状態になる(LRCHub優先では結果を見てすらいなかった)。
+const YTM_CANDIDATE_ID = 'provider_ytm';
+
+const buildYtmCandidate = (res) => {
+  const lyrics = typeof res?.lyrics === 'string' ? res.lyrics.trim() : '';
+  if (!lyrics) return null;
+  // background の buildProviderCandidate と同じ形に揃える。
+  // record_id は持たない = LRCHub のレコードではないので、選んでも
+  // 追加取得も「この候補を選んだ」報告も走らない。
+  return {
+    id: YTM_CANDIDATE_ID,
+    label: LYRICS_SOURCE_LABELS.ytm,
+    providerCandidate: true,
+    lyricsSource: 'ytm',
+    lyrics,
+    dynamicLines: null,
+    animated_lyrics: null,
+    record_id: null,
+    lyricsComplete: true,
+    has_synced: !!res.hasSynced,
+    offset_ms: 0,
+  };
+};
+
+// 時刻なしで出したあとから同期版が見つかることがある(別リリース探索)。
+// 同じものを2つ並べず、同期版で置き換える。
+const offerYtmCandidate = (res) => {
+  const cand = buildYtmCandidate(res);
+  if (!cand) return false;
+  const list = Array.isArray(lyricsCandidates) ? lyricsCandidates : [];
+  const at = list.findIndex((c, i) => getCandidateId(c, i) === YTM_CANDIDATE_ID);
+  if (at < 0) return mergeLyricsCandidates([cand]) > 0;
+  if (!cand.has_synced || list[at].has_synced) return false;
+  const next = list.slice();
+  next[at] = cand;
+  lyricsCandidates = next;
+  return true;
+};
+
 const getCandidateRecordId = (candidate) => {
   if (!candidate || typeof candidate !== 'object') return null;
   const id = candidate.record_id || candidate.recordId ||
@@ -3239,8 +4671,31 @@ const getCandidateRecordId = (candidate) => {
   return id === null || id === undefined || id === '' ? null : String(id);
 };
 
+// 候補が持っている同期の粒度。selectLyricsPayload と違って表示設定には
+// 依らせない。見せたいのは「この候補が何を持っているか」なので。
+// 中身がまだ読み込まれていない候補(LRCHub の検索結果など)は null を返す。
+const describeCandidateSync = (cand) => {
+  if (!cand || typeof cand !== 'object') return null;
+  const animated = cand.animated_lyrics || cand.timedtext || cand.timed_text;
+  if (typeof animated === 'string' && animated.trim()) return '字幕同期';
+  if (hasCharacterSyncedLines(cand.dynamicLines)) return '単語同期';
+  const lyrics = typeof cand.lyrics === 'string' ? cand.lyrics : '';
+  if (lyrics.trim()) {
+    return /\[\d+:\d{2}(?:[.:]\d{1,3})?\]/.test(lyrics) ? '行同期' : '時刻なし';
+  }
+  // 歌詞本体をまだ持っていない候補。has_synced だけは分かることがある
+  if (cand.lyricsComplete !== true) {
+    return cand.has_synced === true ? '行同期以上' : null;
+  }
+  return null;
+};
+
 const buildCandidateLabel = (cand, idx = 0) => {
   if (!cand || typeof cand !== 'object') return `候補${idx + 1}`;
+
+  // 取得元をまたいだ候補は表示名をそのまま使う。
+  // 下のファイル名処理はパス区切りで切り詰めるので通せない。
+  if (typeof cand.label === 'string' && cand.label.trim()) return cand.label.trim();
 
   const rawName = (
     cand.file ||
@@ -3285,28 +4740,29 @@ const safeRuntimeSendMessage = (message) => {
 const refreshRenderedSingerMetadata = async () => {
   const canonicalLyrics = String(currentSingerCanonicalLyrics || '');
   const renderedLyrics = String(lastRawLyricsText || '');
-  const canonicalSingerLines = canonicalLyrics.trim()
+  const canonicalLines = canonicalLyrics.trim()
     ? parseLRCInternal(canonicalLyrics).lines
     : [];
-  const useSingerLayout = hasSingerDisplayMetadata(currentSingerMetadata, canonicalSingerLines);
 
-  // Animated captions have their own free-positioned cue layout. When singer
-  // metadata changes alignment, color, or labels, use the canonical line
-  // layout so that contract remains visible and deterministic.
+  // Animated captions own their free-positioned stage. Singer metadata arrives
+  // asynchronously, so update only the semantic line mapping and leave that
+  // stage intact; renderLyrics() would remove ytm-animated-caption-mode.
   if (
-    useSingerLayout &&
-    canonicalLyrics.trim() && renderedLyrics.trim() &&
-    canonicalLyrics.trim() !== renderedLyrics.trim() &&
+    animatedCaptionData &&
     document.body.classList.contains('ytm-animated-caption-mode')
   ) {
-    await applyLyricsText(canonicalLyrics);
+    const animatedLines = Array.isArray(animatedCaptionData.plainLines)
+      ? animatedCaptionData.plainLines
+      : (Array.isArray(lyricsData) ? lyricsData : []);
+    lyricsData = applySingerMetadataToLines(animatedLines, currentSingerMetadata, {
+      canonicalLines,
+      sameSource: !canonicalLyrics.trim() || canonicalLyrics.trim() === renderedLyrics.trim(),
+    });
+    animatedCaptionData.plainLines = lyricsData;
     return;
   }
 
   if (!Array.isArray(lyricsData) || !lyricsData.length) return;
-  const canonicalLines = canonicalLyrics.trim()
-    ? parseLRCInternal(canonicalLyrics).lines
-    : [];
   const sameSource = !canonicalLyrics.trim() || canonicalLyrics.trim() === renderedLyrics.trim();
   lyricsData = applySingerMetadataToLines(lyricsData, currentSingerMetadata, {
     canonicalLines,
@@ -3420,11 +4876,13 @@ const getCurrentPlaybackLyricText = () => {
     Array.isArray(animatedCaptionData.events)
   ) {
     const tMs = Math.max(0, currentTime * 1000);
-    const activeEvents = animatedCaptionData.events
-      .filter(event => tMs + 40 >= event.startMs && tMs <= event.endMs + 40)
-      .slice(-24);
-    const currentEvent = activeEvents[activeEvents.length - 1];
-    return currentEvent ? String(currentEvent.text || '').trim() : '';
+    const activeEvents = getActiveTimedTextEvents(animatedCaptionData.events, tMs);
+    return activeEvents
+      .map(event => String(
+        typeof event?.visibleText === 'string' ? event.visibleText : event?.text || ''
+      ).trim())
+      .filter((text, index, values) => text && values.indexOf(text) === index)
+      .join(' / ');
   }
 
   if (!Array.isArray(lyricsData) || !lyricsData.length || !hasTimestamp) return null;
@@ -3438,9 +4896,15 @@ const getCurrentPlaybackLyricText = () => {
   }
   if (primaryIndex < 0) return '';
 
-  const activeIndices = new Set([primaryIndex]);
+  const primaryLine = lyricsData[primaryIndex];
+  const primaryHasDynamicRange = Number.isFinite(primaryLine?._dynamicRenderStartSec) &&
+    Number.isFinite(primaryLine?._dynamicRenderEndSec);
+  const primaryIsActive = !primaryHasDynamicRange ||
+    isLineDynamicallyActiveAtTime(primaryLine, currentTime);
+  const activeIndices = new Set();
+  if (primaryIsActive) activeIndices.add(primaryIndex);
   const currentLineTime = lyricsData[primaryIndex]?.time;
-  if (typeof currentLineTime === 'number') {
+  if (primaryIsActive && typeof currentLineTime === 'number') {
     for (let i = primaryIndex - 1; i >= 0; i--) {
       if (!isSameTimestamp(lyricsData[i]?.time, currentLineTime)) break;
       activeIndices.add(i);
@@ -3451,7 +4915,7 @@ const getCurrentPlaybackLyricText = () => {
     }
   }
 
-  if (activeIndices.size === 1 && primaryIndex > 0) {
+  if (primaryIsActive && activeIndices.size === 1 && primaryIndex > 0) {
     const previousIndex = primaryIndex - 1;
     const previousTime = lyricsData[previousIndex]?.time;
     const currentSide = lyricsData[primaryIndex]?.duetSide;
@@ -3639,9 +5103,9 @@ async function ensureCandidateLyricsLoaded(candId) {
     candidate_id: getCandidateId(cand, idx),
     candidate: cand || null
   };
-  console.log('[CS] GET_CANDIDATE_LYRICS request:', payload);
+  YTMLog.log('[CS] GET_CANDIDATE_LYRICS request:', payload);
   const res = await safeRuntimeSendMessage({ type: 'GET_CANDIDATE_LYRICS', payload });
-  console.log('[CS] GET_CANDIDATE_LYRICS response:', res);
+  YTMLog.log('[CS] GET_CANDIDATE_LYRICS response:', res);
   if (
     currentKey !== candidateKeyAtStart ||
     (currentLyricsVideoId || getCurrentVideoId() || '') !== candidateVideoAtStart ||
@@ -3780,7 +5244,7 @@ async function showCandidateHoverPreview(candId, ev) {
   hoverPreviewMouseX = ev?.clientX ?? hoverPreviewMouseX;
   hoverPreviewMouseY = ev?.clientY ?? hoverPreviewMouseY;
   hoverPreviewLoading = true;
-  console.log('[CS] hover preview start:', candId);
+  YTMLog.log('[CS] hover preview start:', candId);
   const el = ensureCandidateHoverPreview();
   if (el) {
     renderCandidateHoverPreview(candId);
@@ -3804,6 +5268,74 @@ function hideCandidateHoverPreview() {
   }
   const el = document.getElementById('ytm-candidate-hover-preview');
   if (el) el.classList.remove('visible');
+}
+
+// ── 他の取得元をその場で探す ──────────────────────────────
+// 通常の取得は LRCHub が答えた時点で他へ問い合わせずに切り上げる。
+// おかげで無駄な通信は無いが、その歌詞が曲に合っていなかった時に
+// 乗り換え先が1件も無い状態になる。ここはユーザーが明示的に頼んだ時
+// だけ走る道で、自動では絶対に呼ばない。
+let alternateLookupInFlight = false;
+async function findAlternateLyricSources() {
+  if (alternateLookupInFlight) return;
+  const meta = getMetadata();
+  if (!meta || !meta.title) {
+    showToast('曲の情報が取れませんでした');
+    return;
+  }
+
+  const requestKey = currentKey;
+  const requestVideoId = currentLyricsVideoId || getCurrentVideoId() || '';
+
+  // すでに手元にある取得元は聞き直さない
+  const known = new Set(
+    (Array.isArray(lyricsCandidates) ? lyricsCandidates : [])
+      .filter(cand => cand && cand.providerCandidate)
+      .map(cand => String(cand.lyricsSource || '').trim().toLowerCase())
+      .filter(Boolean)
+  );
+  if (currentLyricsSource) known.add(currentLyricsSource);
+
+  const videoEl = document.querySelector('video');
+  const durationSec = (videoEl && Number.isFinite(videoEl.duration) && videoEl.duration > 0)
+    ? Math.round(videoEl.duration)
+    : null;
+
+  alternateLookupInFlight = true;
+  showToast('他の取得元を探しています...');
+  try {
+    const res = await safeRuntimeSendMessage({
+      type: 'FIND_ALTERNATE_LYRICS',
+      payload: {
+        track: meta.title,
+        artist: meta.artist || '',
+        album: meta.album || '',
+        duration_sec: durationSec,
+        youtube_url: getCurrentVideoUrl(),
+        video_id: requestVideoId,
+        exclude: [...known],
+      },
+    });
+
+    // 探している間に曲が変わっていたら、その結果はもう別の曲のもの
+    if (
+      requestKey !== currentKey ||
+      requestVideoId !== (currentLyricsVideoId || getCurrentVideoId() || '')
+    ) return;
+
+    const added = mergeLyricsCandidates(res?.candidates);
+    if (!added) {
+      showToast('他の取得元には歌詞がありませんでした');
+      return;
+    }
+
+    refreshCandidateMenu();
+    showToast(`他の取得元を ${added} 件見つけました`);
+    // 押した直後にメニューを閉じているので、結果を見せるために開き直す
+    if (ui.uploadMenu) ui.uploadMenu.classList.add('visible');
+  } finally {
+    alternateLookupInFlight = false;
+  }
 }
 
 async function selectCandidateById(candId) {
@@ -3840,7 +5372,10 @@ async function selectCandidateById(candId) {
     ...normalizeTranslationsToLrcMapLocal(cand.lrcMap)
   };
   setLyricsMeaningData(cand);
-  updateLyricsSourceState({ lyricsSource: 'lrchub', fallbackUsed: false }, false);
+  // 取得元をまたいだ候補を選べるようになったので、ここを 'lrchub' 固定にはできない。
+  // 「歌詞ソース」表示とキャッシュに嘘が入る。
+  const candidateSource = String(cand.lyricsSource || '').trim().toLowerCase() || 'lrchub';
+  updateLyricsSourceState({ lyricsSource: candidateSource, fallbackUsed: false }, false);
   duetSubDynamicLines = null;
   _duetExcludedTimes = new Set();
   const candidateRecordId = getCandidateRecordId(cand);
@@ -3861,7 +5396,16 @@ async function selectCandidateById(candId) {
       lrcMap: lyricsTranslationMap || null,
       meaningData: lyricsMeaning || null,
       candidateId: cand.id || candId || null,
-      lyricsSource: 'lrchub',
+      // 本人が選んだ取得元であることを残す。これが無いと次に同じ曲を
+      // かけた時、キャッシュの優先度が 2 のままになり、裏で走った取得の
+      // 結果(同じく 2)に上書きされる。選んだ歌詞が一瞬出てから
+      // 差し替わるので、選んだこと自体が無かったことになっていた。
+      // 手動アップロード(manualLyrics)と同じ重みで扱う。
+      manualChoice: true,
+      // 候補一覧も持たせる。次に開いた時、裏の取得が返ってくる前でも
+      // メニューから選び直せるようにするため。
+      candidates: Array.isArray(lyricsCandidates) ? lyricsCandidates : null,
+      lyricsSource: candidateSource,
       fallbackUsed: false,
       lyricsQuality: selectedPayload.quality,
       offset_ms: Number.isFinite(Number(cand.offset_ms)) ? Number(cand.offset_ms) : 0,
@@ -3875,14 +5419,28 @@ async function selectCandidateById(candId) {
   const youtube_url = getCurrentVideoUrl();
   const video_id = selectionVideoId;
   const candidate_id = cand.id || candId;
-  try {
-    chrome.runtime.sendMessage(
-      { type: 'SELECT_LYRICS_CANDIDATE', payload: { youtube_url, video_id, candidate_id } },
-      (res) => console.log('[CS] SELECT_LYRICS_CANDIDATE result:', res)
-    );
-  } catch (e) {
-    console.warn('[CS] SELECT_LYRICS_CANDIDATE failed to send', e);
+  // LRCHub のレコードに対する「この候補を選んだ」報告。他の取得元の候補で
+  // 投げると、向こうに存在しない ID を送ることになる。
+  const reportsToLrchub = candidateSource === 'lrchub' && !cand.providerCandidate;
+  if (reportsToLrchub) {
+    try {
+      chrome.runtime.sendMessage(
+        { type: 'SELECT_LYRICS_CANDIDATE', payload: { youtube_url, video_id, candidate_id } },
+        (res) => YTMLog.log('[CS] SELECT_LYRICS_CANDIDATE result:', res)
+      );
+    } catch (e) {
+      console.warn('[CS] SELECT_LYRICS_CANDIDATE failed to send', e);
+    }
   }
+  // 報告した時だけ取り直す。サーバー側がその候補を正として反映するので、
+  // 10 秒後に引き直して canonical な状態を拾う。
+  //
+  // 報告していない取得元(SimpMusic / LyricsPlus / LrcLib)で走らせてはいけない。
+  // 拾い直すものが何も無いのに storage.remove で「選んだ」記録ごと消し、
+  // loadLyrics が最初から取り直す。YTM優先なら当然 YTM に戻る。
+  // 実際「SimpMusic に切り替えたのに10秒後 YTM に戻る」報告が出た。
+  if (!reportsToLrchub) return;
+
   const reloadKey = currentKey;
   const reloadVideoId = selectionVideoId;
   setTimeout(() => {
@@ -3988,13 +5546,23 @@ function refreshCandidateMenu() {
     return;
   }
   section.style.display = 'block';
-  lyricsCandidates.forEach((cand, idx) => {
+
+  const appendCandidateButton = (cand, idx) => {
     const id = getCandidateId(cand, idx);
     const btn = document.createElement('button');
     btn.className = 'ytm-upload-menu-item ytm-upload-menu-item-candidate';
     btn.dataset.action = 'candidate';
     btn.dataset.candidateId = id;
     btn.textContent = buildCandidateLabel(cand, idx);
+    // 同期の粒度を添える。どれを選べば単語単位で光るのかが、
+    // 選ぶ前に分かるようにするため。
+    const syncLabel = describeCandidateSync(cand);
+    if (syncLabel) {
+      const tag = document.createElement('span');
+      tag.className = 'ytm-candidate-sync';
+      tag.textContent = syncLabel;
+      btn.appendChild(tag);
+    }
     if (String(selectedCandidateId || '') === id) {
       btn.classList.add('is-selected');
     }
@@ -4011,11 +5579,48 @@ function refreshCandidateMenu() {
       hideCandidateHoverPreview();
     });
     list.appendChild(btn);
+  };
+
+  // 取得元をまたいだ候補は別枠。いま画面に出ている取得元そのものは、
+  // 同じものを2回並べても選ぶ意味が無いので伏せる。
+  const ownCandidates = [];
+  const providerCandidates = [];
+  lyricsCandidates.forEach((cand, idx) => {
+    if (!cand || !cand.providerCandidate) {
+      ownCandidates.push({ cand, idx });
+      return;
+    }
+    const id = getCandidateId(cand, idx);
+    const isSelected = String(selectedCandidateId || '') === id;
+    const source = String(cand.lyricsSource || '').trim().toLowerCase();
+    if (!isSelected && source && source === currentLyricsSource) return;
+    providerCandidates.push({ cand, idx });
   });
+
+  ownCandidates.forEach(({ cand, idx }) => appendCandidateButton(cand, idx));
+
+  if (providerCandidates.length) {
+    if (ownCandidates.length) {
+      const subtitle = document.createElement('div');
+      subtitle.className = 'ytm-upload-menu-subtitle';
+      subtitle.textContent = '他の取得元';
+      list.appendChild(subtitle);
+    }
+    providerCandidates.forEach(({ cand, idx }) => appendCandidateButton(cand, idx));
+  }
+
+  if (!ownCandidates.length && !providerCandidates.length) {
+    section.style.display = 'none';
+  }
+
+  // ボタンを跳ねさせるのは今までどおり「その歌詞自身の候補」がある時だけ。
+  // 他の取得元は毎曲ぶら下がるので、ここで光らせると常時鳴るベルになる。
   if (ui.lyricsBtn) {
     ui.lyricsBtn.classList.remove('ytm-lyrics-has-candidates');
-    void ui.lyricsBtn.offsetWidth;
-    ui.lyricsBtn.classList.add('ytm-lyrics-has-candidates');
+    if (ownCandidates.length) {
+      void ui.lyricsBtn.offsetWidth;
+      ui.lyricsBtn.classList.add('ytm-lyrics-has-candidates');
+    }
   }
 }
 
@@ -4089,6 +5694,19 @@ function setupUploadMenu(uploadBtn) {
         <span class="ytm-upload-menu-item-icon"><svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor" style="vertical-align: -0.15em; margin-right: 6px;"><path d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z"/></svg></span>
         <span>歌詞同期を追加 / AddTiming</span>
       </button>
+      <button class="ytm-upload-menu-item" data-action="find-alternates">
+        <span class="ytm-upload-menu-item-icon"><svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor" style="vertical-align: -0.15em; margin-right: 6px;"><path d="M15.5 14h-.79l-.28-.27A6.47 6.47 0 0 0 16 9.5 6.5 6.5 0 1 0 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"/></svg></span>
+        <span>他の取得元から探す / OtherSources</span>
+      </button>
+      <div class="ytm-upload-menu-offset">
+        <div class="ytm-upload-menu-subtitle">ズレを直す / Timing</div>
+        <div class="ytm-offset-row">
+          <button class="ytm-offset-btn" data-action="offset-minus" title="歌詞を早める">−</button>
+          <span class="ytm-offset-value" data-role="offset-value">0.0s</span>
+          <button class="ytm-offset-btn" data-action="offset-plus" title="歌詞を遅らせる">＋</button>
+          <button class="ytm-offset-btn ytm-offset-reset" data-action="offset-reset" title="0 に戻す">⟲</button>
+        </div>
+      </div>
       <div class="ytm-upload-menu-locks" style="display:none;">
         <div class="ytm-upload-menu-subtitle">歌詞を確定 / Confirm</div>
         <div class="ytm-upload-menu-lock-list"></div>
@@ -4112,6 +5730,18 @@ function setupUploadMenu(uploadBtn) {
     toggleMenu();
   });
   ui.uploadMenu.addEventListener('click', (ev) => {
+    // ズレ直しはメニューを閉じない。合うまで何度も押すものなので。
+    const offsetBtn = ev.target.closest('.ytm-offset-btn');
+    if (offsetBtn) {
+      ev.stopPropagation();
+      const step = offsetBtn.dataset.action === 'offset-minus' ? -LYRIC_OFFSET_STEP_MS
+        : offsetBtn.dataset.action === 'offset-plus' ? LYRIC_OFFSET_STEP_MS
+          : null;
+      const next = step === null ? 0 : (Number(config.syncOffset) || 0) + step;
+      applyLyricOffsetMs(next);
+      return;
+    }
+
     const target = ev.target.closest('.ytm-upload-menu-item');
     if (!target) return;
     if (target.classList.contains('ytm-upload-menu-item-disabled')) {
@@ -4131,6 +5761,8 @@ function setupUploadMenu(uploadBtn) {
       const base = 'https://lrchub.coreone.work';
       const lrchubUrl = videoUrl ? `${base}/manual?video_url=${encodeURIComponent(videoUrl)}` : base;
       window.open(lrchubUrl, '_blank');
+    } else if (action === 'find-alternates') {
+      void findAlternateLyricSources();
     } else if (action === 'candidate' && candId) {
       selectCandidateById(candId);
     } else if (action === 'lock-request' && reqId) {
@@ -4144,6 +5776,9 @@ function setupUploadMenu(uploadBtn) {
       if (!ui.uploadMenu) return;
       if (!ui.uploadMenu.classList.contains('visible')) return;
       if (ui.uploadMenu.contains(ev.target) || uploadBtn.contains(ev.target)) return;
+      // 取得元バッジは自分で開け閉てする。ここで先に閉じると、直後に
+      // バッジ側が開き直して二度と閉じられなくなる。
+      if (ev.target?.closest?.('#ytm-lyrics-source-debug')) return;
       ui.uploadMenu.classList.remove('visible');
     }, true);
   }
@@ -4265,6 +5900,8 @@ function applyUiScale(value) {
   }
   // 上記のレイアウト変化で出る scroll イベントをユーザー操作と誤検出させない
   suppressUserScrollDetection(400);
+  // 文字サイズが変わると語の横位置も変わる
+  invalidateLyricLineSweeps();
   return scale;
 }
 
@@ -4296,6 +5933,10 @@ async function initSettings() {
   config.useLrcLibFallback = true;  // 歌詞ソース設定は廃止。常に全ソースを使う
   const animatedCaptionStored = await storage.get('ytm_animated_captions_enabled');
   if (animatedCaptionStored !== null) config.useAnimatedCaptions = !!animatedCaptionStored;
+  const appleSyncStored = await storage.get('ytm_apple_sync_style');
+  if (appleSyncStored !== null) config.appleSyncStyle = !!appleSyncStored;
+  const sourceBadgeStored = await storage.get('ytm_lyrics_source_badge');
+  if (sourceBadgeStored !== null) config.showLyricsSource = !!sourceBadgeStored;
   const singerColorsStored = await storage.get('ytm_singer_colors_enabled');
   if (singerColorsStored !== null) config.useSingerColors = !!singerColorsStored;
   const sourceModeStored = await storage.get('ytm_lyric_source_mode');
@@ -4422,7 +6063,9 @@ function renderSettingsPanel() {
     trans: `<svg viewBox="0 0 24 24"><path d="M12.87 15.07l-2.54-2.51.03-.03c1.74-1.94 2.98-4.17 3.71-6.53H17V4h-7V2H8v2H1v1.99h11.17C11.5 7.92 10.44 9.75 9 11.35 8.07 10.32 7.3 9.19 6.69 8h-2c.73 1.63 1.73 3.17 2.98 4.56l-5.09 5.02L4 19l5-5 3.11 3.11.76-2.04zM18.5 10h-2L12 22h2l1.12-3h4.75L21 22h2l-4.5-12zm-2.62 7l1.62-4.33L19.12 17h-3.24z"/></svg>`,
     data: `<svg viewBox="0 0 24 24"><path d="M12 2C7.58 2 4 3.79 4 6s3.58 4 8 4 8-1.79 8-4-3.58-4-8-4zM4 8.55V12c0 2.21 3.58 4 8 4s8-1.79 8-4V8.55C18.83 9.99 15.72 11 12 11S5.17 9.99 4 8.55zM4 14.55V18c0 2.21 3.58 4 8 4s8-1.79 8-4v-3.45C18.83 15.99 15.72 17 12 17s-6.83-1.01-8-2.45z"/></svg>`,
     save: `<svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M17 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V7l-4-4zm-5 16a3 3 0 1 1 0-6 3 3 0 0 1 0 6zm3-10H5V5h10v4z"/></svg>`,
-    trash: `<svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/></svg>`
+    trash: `<svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/></svg>`,
+    discord: `<svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M19.27 5.33A18.6 18.6 0 0 0 14.9 4l-.25.45c1.4.33 2.7.9 3.9 1.65a13.3 13.3 0 0 0-4.55-1.45 13.9 13.9 0 0 0-4 0A13.3 13.3 0 0 0 5.45 6.1c1.2-.75 2.5-1.32 3.9-1.65L9.1 4a18.6 18.6 0 0 0-4.37 1.33C2.14 9.2 1.44 12.97 1.79 16.69a18.7 18.7 0 0 0 5.6 2.83l1.2-1.66c-.66-.25-1.28-.55-1.87-.92l.46-.34a13.3 13.3 0 0 0 11.64 0l.46.34c-.59.37-1.21.67-1.87.92l1.2 1.66a18.7 18.7 0 0 0 5.6-2.83c.42-4.3-.7-8.03-2.94-11.36zM8.52 14.46c-.9 0-1.63-.82-1.63-1.83 0-1 .72-1.83 1.63-1.83.92 0 1.65.83 1.63 1.83 0 1.01-.72 1.83-1.63 1.83zm6.96 0c-.9 0-1.63-.82-1.63-1.83 0-1 .72-1.83 1.63-1.83.92 0 1.65.83 1.63 1.83 0 1.01-.71 1.83-1.63 1.83z"/></svg>`,
+    github: `<svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M12 2C6.48 2 2 6.58 2 12.25c0 4.53 2.87 8.37 6.84 9.73.5.1.68-.22.68-.49l-.01-1.72c-2.78.62-3.37-1.37-3.37-1.37-.46-1.18-1.11-1.5-1.11-1.5-.91-.64.07-.62.07-.62 1 .07 1.53 1.06 1.53 1.06.89 1.570 2.34 1.12 2.91.86.09-.66.35-1.12.63-1.38-2.22-.26-4.56-1.14-4.56-5.06 0-1.12.39-2.03 1.03-2.75-.1-.26-.45-1.3.1-2.71 0 0 .84-.28 2.75 1.05a9.3 9.3 0 0 1 5 0c1.91-1.33 2.75-1.05 2.75-1.05.55 1.41.2 2.45.1 2.71.64.72 1.03 1.63 1.03 2.75 0 3.93-2.34 4.8-4.57 5.05.36.32.68.94.68 1.9l-.01 2.82c0 .27.18.6.69.49A10.06 10.06 0 0 0 22 12.25C22 6.58 17.52 2 12 2z"/></svg>`
   };
 
   let extVersion = '';
@@ -4445,6 +6088,16 @@ function renderSettingsPanel() {
         </button>
 
         <div class="settings-tabs-footer">
+           <div class="settings-links">
+             <a class="settings-link-btn" href="https://discord.gg/cpBCACpt6j"
+                target="_blank" rel="noopener noreferrer" title="Discord" aria-label="Discord">
+               ${ICONS.discord}
+             </a>
+             <a class="settings-link-btn" href="https://github.com/naikaku1/YTM_Immersion"
+                target="_blank" rel="noopener noreferrer" title="GitHub" aria-label="GitHub">
+               ${ICONS.github}
+             </a>
+           </div>
            <button id="save-settings-btn" class="settings-save-btn">
              ${ICONS.save}
              <span>${t('settings_save')}</span>
@@ -4498,9 +6151,9 @@ function renderSettingsPanel() {
               <div class="setting-row stacked">
                 <div class="setting-row-top">
                   <span class="setting-name">背景の明るさ (Brightness)</span>
-                  <span class="setting-value-badge" id="bright-val">${Math.round((config.bgBrightness || 0.35) * 100)}%</span>
+                  <span class="setting-value-badge" id="bright-val">${Math.round((config.bgBrightness || DEFAULT_BG_BRIGHTNESS) * 100)}%</span>
                 </div>
-                <input type="range" id="bright-slider" min="0.1" max="1.0" step="0.05" value="${config.bgBrightness || 0.35}">
+                <input type="range" id="bright-slider" min="0.1" max="1.0" step="0.05" value="${config.bgBrightness || DEFAULT_BG_BRIGHTNESS}">
               </div>
             </div>
 
@@ -4513,6 +6166,10 @@ function renderSettingsPanel() {
                 </div>
                 <input type="range" id="weight-slider" min="100" max="900" step="100" value="${config.lyricWeight || 800}">
               </div>
+              <label class="setting-row toggle-label">
+                <span class="setting-name">${t('settings_apple_sync')}</span>
+                <input type="checkbox" id="apple-sync-toggle">
+              </label>
               <label class="setting-row toggle-label">
                 <span class="setting-name">${t('settings_animated_captions')}</span>
                 <input type="checkbox" id="animated-caption-toggle">
@@ -4537,6 +6194,10 @@ function renderSettingsPanel() {
                   <button class="ytm-lang-pill" data-value="lrchub">${t('settings_source_lrchub')}</button>
                 </div>
               </div>
+              <label class="setting-row toggle-label">
+                <span class="setting-name">${t('settings_show_source')}</span>
+                <input type="checkbox" id="show-source-toggle">
+              </label>
             </div>
           </div>
 
@@ -4633,6 +6294,7 @@ function renderSettingsPanel() {
                 <button id="clear-all-btn" class="settings-action-btn btn-neutral">リセット</button>
               </div>
             </div>
+
           </div>
 
         </div>
@@ -4662,6 +6324,8 @@ function renderSettingsPanel() {
   document.getElementById('keep-past-lyrics-toggle').checked = !!config.keepPastLyrics;
   document.getElementById('apple-bg-toggle').checked = !!config.appleBg;
   document.getElementById('low-cpu-toggle').checked = !!config.lowCpuMode;
+  document.getElementById('apple-sync-toggle').checked = !!config.appleSyncStyle;
+  document.getElementById('show-source-toggle').checked = !!config.showLyricsSource;
   document.getElementById('animated-caption-toggle').checked = !!config.useAnimatedCaptions;
   document.getElementById('singer-colors-toggle').checked = !!config.useSingerColors;
   document.getElementById('meaning-always-toggle').checked = !!config.alwaysShowMeaning;
@@ -4741,7 +6405,9 @@ function renderSettingsPanel() {
       savedUiLang,
       savedAnimatedCaptions,
       savedLrcLibFallback,
-      savedSourceMode
+      savedSourceMode,
+      savedAppleSyncStyle,
+      savedLowCpuMode
     ] = await Promise.all([
       storage.get('ytm_deepl_key'),
       storage.get('ytm_main_lang'),
@@ -4751,7 +6417,9 @@ function renderSettingsPanel() {
       storage.get('ytm_ui_lang'),
       storage.get('ytm_animated_captions_enabled'),
       storage.get('ytm_lrclib_fallback'),
-      storage.get('ytm_lyric_source_mode')
+      storage.get('ytm_lyric_source_mode'),
+      storage.get('ytm_apple_sync_style'),
+      storage.get('ytm_low_cpu_mode')
     ]);
 
     const prevDeepLKey = savedDeepLKey || '';
@@ -4762,7 +6430,9 @@ function renderSettingsPanel() {
     const prevUiLang = savedUiLang || 'ja';
     const prevAnimatedCaptions = savedAnimatedCaptions !== null ? !!savedAnimatedCaptions : false;
     const prevUseLrcLibFallback = savedLrcLibFallback !== null ? !!savedLrcLibFallback : true;
-    const prevSourceMode = savedSourceMode || 'standard';
+    const prevSourceMode = normalizeSourceMode(savedSourceMode);
+    const prevAppleSync = savedAppleSyncStyle !== null ? !!savedAppleSyncStyle : true;
+    const prevLowCpu = savedLowCpuMode !== null ? !!savedLowCpuMode : false;
 
     // 画面から値を取得
     config.deepLKey = document.getElementById('deepl-key-input').value.trim();
@@ -4772,6 +6442,8 @@ function renderSettingsPanel() {
     config.keepPastLyrics = document.getElementById('keep-past-lyrics-toggle').checked;
     config.appleBg = document.getElementById('apple-bg-toggle').checked;
     config.lowCpuMode = document.getElementById('low-cpu-toggle').checked;
+    config.appleSyncStyle = document.getElementById('apple-sync-toggle').checked;
+    config.showLyricsSource = document.getElementById('show-source-toggle').checked;
     config.useAnimatedCaptions = document.getElementById('animated-caption-toggle').checked;
     config.useSingerColors = document.getElementById('singer-colors-toggle').checked;
     config.alwaysShowMeaning = document.getElementById('meaning-always-toggle').checked;
@@ -4793,6 +6465,8 @@ function renderSettingsPanel() {
       storage.set('ytm_keep_past_lyrics', config.keepPastLyrics),
       storage.set('ytm_apple_bg', config.appleBg),
       storage.set('ytm_low_cpu_mode', config.lowCpuMode),
+      storage.set('ytm_apple_sync_style', config.appleSyncStyle),
+      storage.set('ytm_lyrics_source_badge', config.showLyricsSource),
       storage.set('ytm_animated_captions_enabled', config.useAnimatedCaptions),
       storage.set('ytm_singer_colors_enabled', config.useSingerColors),
       storage.set('ytm_lrclib_fallback', config.useLrcLibFallback),
@@ -4813,7 +6487,11 @@ function renderSettingsPanel() {
     document.body.classList.toggle('ytm-apple-bg', !!config.appleBg);
     document.body.classList.toggle('ytm-lightweight-mode', !!config.lowCpuMode);
     document.body.classList.toggle('ytm-singer-colors-enabled', !!config.useSingerColors);
+    applyAppleSyncClass();
+    // 保存した瞬間に出す/消す(曲が変わるまで待たせない)
+    updateLyricsSourceDebugBadge(null);
     if (PipManager.pipWindow?.document) {
+      PipManager.pipWindow.document.body.classList.toggle('ytm-keep-past-lyrics', !!config.keepPastLyrics);
       PipManager.pipWindow.document.body.classList.toggle('ytm-singer-colors-enabled', !!config.useSingerColors);
     }
     document.documentElement.style.setProperty('--ytm-lyric-weight', config.lyricWeight);
@@ -4828,6 +6506,10 @@ function renderSettingsPanel() {
       prevUseSharedTrans !== config.useSharedTranslateApi
     );
     const animatedCaptionsChanged = prevAnimatedCaptions !== config.useAnimatedCaptions;
+    // Apple Music 風と従来式では DOM の作りが違う(語ごとの span か
+    // 1文字ずつの span か)。切り替えたら描き直さないと反映されない。
+    const wordSyncChanged = prevAppleSync !== config.appleSyncStyle ||
+      prevLowCpu !== config.lowCpuMode;
     const lyricsSourceChanged = (
       prevSourceMode !== config.lyricSourceMode ||
       prevUseLrcLibFallback !== config.useLrcLibFallback
@@ -4837,7 +6519,7 @@ function renderSettingsPanel() {
 
     ui.settings.classList.remove('active');
 
-    if (animatedCaptionsChanged || lyricsSourceChanged) {
+    if (animatedCaptionsChanged || lyricsSourceChanged || wordSyncChanged) {
       const metaNow = getMetadata();
       if (metaNow?.title && metaNow?.artist) {
         await loadLyrics(metaNow);
@@ -5358,6 +7040,11 @@ async function loadLyrics(meta, options = {}) {
   config.useLrcLibFallback = true;  // 歌詞ソース設定は廃止。常に全ソースを使う
   const animatedCaptionStored = await storage.get('ytm_animated_captions_enabled');
   if (animatedCaptionStored !== null && animatedCaptionStored !== undefined) config.useAnimatedCaptions = !!animatedCaptionStored;
+  const appleSyncStored = await storage.get('ytm_apple_sync_style');
+  if (appleSyncStored !== null && appleSyncStored !== undefined) config.appleSyncStyle = !!appleSyncStored;
+  const sourceBadgeStored = await storage.get('ytm_lyrics_source_badge');
+  if (sourceBadgeStored !== null && sourceBadgeStored !== undefined) config.showLyricsSource = !!sourceBadgeStored;
+  applyAppleSyncClass();
   const sourceModeStored = await storage.get('ytm_lyric_source_mode');
   config.lyricSourceMode = normalizeSourceMode(sourceModeStored);
 
@@ -5420,10 +7107,10 @@ async function loadLyrics(meta, options = {}) {
       const cacheMatchesVideo = cached.cacheVersion === LYRICS_CACHE_VERSION &&
         cachedVideoId === requestVideoId;
       const cachedSource = String(cached.lyricsSource || cached.source || '').trim().toLowerCase();
-      const cachedLrcLibIsFallback = cachedSource === 'lrclib' &&
-        (config.lyricSourceMode || 'standard') === 'standard';
-      const cacheSourceAllowed = !cachedLrcLibIsFallback || !!config.useLrcLibFallback;
-      if (cacheMatchesVideo && cacheSourceAllowed) {
+      // 「新ソースのみ」は取得元を確かめるためのモード。前に別の取得元で
+      // 拾ってキャッシュした歌詞をそのまま出すと、画面に何が出ているのか
+      // 分からなくなるので、そのキャッシュは使わずに引き直す。
+      if (cacheMatchesVideo) {
         const cachedSelection = selectLyricsPayload(cached);
         data = cachedSelection.text;
         cachedSingerRecordId = String(cached.record_id || cached.recordId || '').trim() || null;
@@ -5442,11 +7129,18 @@ async function loadLyrics(meta, options = {}) {
           };
         }
         if (cached.meaningData) setLyricsMeaningData(cached.meaningData);
-        currentLyricsResultPriority = cached.manualLyrics ? 3 : (cachedLrcLibIsFallback ? 1 : 2);
+        // 本人の決定(手動アップロード / 候補の選択)は最優先で据え置く。
+        // 裏で走った取得に上書きさせない。
+        const cachedIsUserChoice = !!(cached.manualLyrics || cached.manualChoice);
+        if (cached.manualChoice && cached.candidateId) {
+          // 選択中の印をメニューに戻し、遅れて届く差し替えも止める
+          selectedCandidateId = String(cached.candidateId);
+        }
+        currentLyricsResultPriority = cachedIsUserChoice ? 3 : 2;
         dataPriority = currentLyricsResultPriority;
         currentLyricsQuality = cachedSelection.quality;
         dataQuality = cachedSelection.quality;
-        updateLyricsSourceState({ ...cached, fallbackUsed: cachedLrcLibIsFallback }, !!data);
+        updateLyricsSourceState({ ...cached, fallbackUsed: false }, !!data);
       }
     }
   }
@@ -5489,13 +7183,21 @@ async function loadLyrics(meta, options = {}) {
     const youtube_url = getCurrentVideoUrl();
     const video_id = requestVideoId;
     const translate_to = getRequestedLrchubTranslateLangs();
+    // LyricsPlus はアルバム名と尺で候補を絞る。無ければ無いで動くが、
+    // 同名異曲・別リリースを掴む確率がはっきり下がる。
+    const videoEl = document.querySelector('video');
+    const durationSec = (videoEl && Number.isFinite(videoEl.duration) && videoEl.duration > 0)
+      ? Math.round(videoEl.duration)
+      : null;
     const payload = {
       track,
       artist,
+      album: (meta && meta.album) || '',
+      duration_sec: durationSec,
       youtube_url,
       video_id,
       use_lrclib: config.useLrcLibFallback,
-      lyric_source_mode: config.lyricSourceMode || 'standard',
+      lyric_source_mode: config.lyricSourceMode || 'ytm',
       request_id: requestId,
       track_key: thisKey,
     };
@@ -5504,37 +7206,121 @@ async function loadLyrics(meta, options = {}) {
     // YouTube Music の行同期歌詞は content script からしか取れない
     // (Service Worker の fetch は Origin: chrome-extension:// が付いて YouTube に 403 で弾かれる)。
     // background への問い合わせと並列に走らせるので、待ち時間は増えない。
+    // 優先設定に関わらず必ず走らせる。LRCHub優先でも、乗り換え先として
+    // 候補メニューに並べるため。
+
+    // 取ってきた歌詞を候補メニューへ流す。
+    // background が組む候補一覧には YTM が入らない(あちらからは叩けない)ので、
+    // ここで合流させないとメニューに出てこない。表示に使うかどうかとは
+    // 無関係に、届いたら必ず並べる。
+    // LRCHub優先では下の分岐(preferYtm || !backgroundHasLyrics)が結果を
+    // 見てすらいなかったため、取得だけして捨てている状態になっていた。
+    const noteYtmCandidate = (res) => {
+      if (!res) return;
+      // 待っている間に曲が変わっていたら、それは別の曲の歌詞
+      if (thisKey !== currentKey || video_id !== (currentLyricsVideoId || '')) return;
+      if (offerYtmCandidate(res)) refreshCandidateMenu();
+    };
+
     const ytmPromise = (window.YTMLyrics && video_id)
-      ? window.YTMLyrics.fetch(video_id)
+      ? window.YTMLyrics.fetch(video_id, {
+        // YTM が時刻なしの歌詞しか持っていない曲では、別リリースに同期版が
+        // あることがある。その探索は数秒かかるので待たずに先へ進み、
+        // 見つかった時だけここで差し替える。
+        onUpgrade: (upgraded) => {
+          if (!upgraded || !upgraded.hasSynced) return;
+          // 候補の方も同期版に差し替える(時刻なしのまま残さない)
+          noteYtmCandidate(upgraded);
+          void applyLateLyricsUpgrade({
+            success: true,
+            lyricsSource: 'ytm',
+            lyrics: upgraded.lyrics,
+            animated_lyrics: null,
+            dynamicLines: null,
+            track_key: thisKey,
+            request_id: requestId,
+            video_id,
+          });
+        },
+      })
       : Promise.resolve(null);
 
-    // 既に返っているかを見るためのフラグ。追加の待ち時間は発生しない。
-    let backgroundSettled = null;
+    void ytmPromise
+      .then(noteYtmCandidate)
+      .catch(() => { /* 候補に出せないだけ。表示には影響しない */ });
+
+    // 上限で打ち切った YTM を、届いた時に差し替える予約。
+    // 曲が変わっていたら捨てる。差し替えてよいかの判断は
+    // applyLateLyricsUpgrade 側(品質・手動選択・同一曲の確認)に任せる。
+    const scheduleYtmLateUpgrade = () => {
+      const lateKey = thisKey;
+      const lateVideoId = video_id;
+      const lateRequestId = requestId;
+      void ytmPromise.then(late => {
+        if (!late || !late.hasSynced || !late.lyrics) return;
+        if (lateKey !== currentKey || lateVideoId !== (currentLyricsVideoId || '')) return;
+        if (lateRequestId !== activeLyricsRequestId) return;
+        YTMLog.log('[CS] YouTube Music が遅れて届いたので差し替えを試みる');
+        return applyLateLyricsUpgrade({
+          success: true,
+          lyricsSource: 'ytm',
+          lyrics: late.lyrics,
+          animated_lyrics: null,
+          dynamicLines: null,
+          track_key: lateKey,
+          request_id: lateRequestId,
+          video_id: lateVideoId,
+        });
+      }).catch(() => { /* 遅れて届く方の失敗は表示に影響しない */ });
+    };
+
     const backgroundPromise = new Promise(resolve => {
       chrome.runtime.sendMessage(
         { type: 'GET_LYRICS', payload },
         resolve
       );
     });
-    backgroundPromise.then(r => { backgroundSettled = r || null; }).catch(() => { });
 
     // YTM優先で YTM が同期歌詞を持っているなら、LRCHub の完了を待つ意味はない。
     // 以前はここで background を無条件に await していたため、YTM が 250ms で
     // 返っていても LRCHub のレース(1.5秒)とフォールバック(各8秒)が終わるまで
     // 描画されず、並列に走らせた意味が消えていた。
     const preferYtmSource = (config.lyricSourceMode || 'ytm') === 'ytm';
-    const ytmEarly = preferYtmSource ? await ytmPromise : null;
+
+    // YTM の待ちには上限を置く。
+    //
+    // YTM の取得は next → browse の2段直列で、各段のタイムアウトが 5 秒。
+    // 別リリースや counterpart の探索に入るとさらに伸びる。ここで完了を
+    // 待ち切ると、LRCHub が 300ms で答えていても最大10秒ほど白紙になる。
+    // 並列に走らせている意味がこの一行で消えていた。
+    //
+    // 間に合わなければ先に他の歌詞を出し、YTM は届いた時に差し替える。
+    // 差し替えの可否は applyLateLyricsUpgrade の判断に委ねる。あちらは
+    // 品質が下がる差し替えを拒むので、同期の粗い YTM が単語同期を
+    // 上書きすることはない。「YTM優先」が完全に通るのは YTM が間に合った
+    // 回だけになるが、10秒の白紙を避ける方を採る。
+    const ytmWaitMarker = {};
+    const ytmRaced = preferYtmSource
+      ? await Promise.race([
+        ytmPromise,
+        new Promise(resolve => setTimeout(() => resolve(ytmWaitMarker), YTM_EARLY_WAIT_MS)),
+      ])
+      : null;
+    const ytmWaitTimedOut = ytmRaced === ytmWaitMarker;
+    const ytmEarly = ytmWaitTimedOut ? null : ytmRaced;
     const skipWaitingBackground = !!(ytmEarly && ytmEarly.hasSynced);
 
-    // YTM を採用できるなら background は一切待たない。
-    // 以前はメタデータ目当てに 400ms 待っていたが、間に合わなかった分は
-    // 下の late ハンドラで反映されるので、この待ち時間は丸ごと無駄だった。
-    // (カタログ楽曲なら 235ms で描画できるのに 635ms かかっていた)
-    let res = skipWaitingBackground ? backgroundSettled : await backgroundPromise;
+    let res = skipWaitingBackground
+      // 既に返っていればメタデータ(候補・翻訳・解説)ごと使えるので、短時間だけ待つ
+      ? await Promise.race([
+        backgroundPromise,
+        new Promise(resolve => setTimeout(() => resolve(null), 400)),
+      ])
+      : await backgroundPromise;
 
-    if (skipWaitingBackground && !res) {
-      // 間に合わなかった分は、届いた時にメタデータだけ反映する。
-      // 歌詞そのものは YTM を採用済みなので触らない。
+    if (skipWaitingBackground && res === null) {
+      // 間に合わなかった分のメタデータを反映する。通常歌詞は YTM を
+      // 維持するが、アニメーション表示が有効な srv3 は後着でも差し替える。
       const metaKey = thisKey, metaVideoId = video_id, metaRequestId = requestId;
       backgroundPromise.then(late => {
         if (!late || !late.success) return;
@@ -5554,6 +7340,11 @@ async function loadLyrics(meta, options = {}) {
         refreshCandidateMenu();
         refreshLockMenu();
         refreshMeaningUi();
+        if (selectLyricsPayload(late).mode === 'animated') {
+          void applyLateLyricsUpgrade(late).catch((error) => {
+            console.warn('[YTM] Failed to apply late srv3 lyrics:', error);
+          });
+        }
       }).catch(() => { });
     }
     if (
@@ -5561,7 +7352,7 @@ async function loadLyrics(meta, options = {}) {
       video_id !== (currentLyricsVideoId || '') ||
       requestId !== activeLyricsRequestId
     ) return;
-    console.log('[CS] GET_LYRICS response:', res);
+    YTMLog.log('[CS] GET_LYRICS response:', res);
 
     // 歌詞ソースの優先設定は 'ytm' / 'lrchub' の2択。どちらも他方へフォールバックする。
     //   YTM優先   … YTM に同期歌詞があればそれ。無ければ LRCHub / LrcLib
@@ -5569,32 +7360,52 @@ async function loadLyrics(meta, options = {}) {
     // 品質スコアによる自動判定はしない。設定した側が確実に優先される方が予測しやすい。
     try {
       const preferYtm = preferYtmSource;
-      const backgroundHasLyrics = !!res?.success &&
-        typeof res.lyrics === 'string' && !!res.lyrics.trim();
+      const backgroundSelection = selectLyricsPayload(res);
+      const backgroundHasLyrics = !!res?.success && !!backgroundSelection.text.trim();
+      const backgroundHasSrv3 = backgroundHasLyrics && backgroundSelection.mode === 'animated';
 
       // LRCHub優先で、しかも LRCHub 側が既に歌詞を返しているなら YTM の結果は使わない。
       // ここで待つと、表示が YTM の完了まで丸ごと遅れてしまう
       // (カタログ解決が走る曲では1秒以上かかる)。走らせたままにして待たない。
       if (preferYtm || !backgroundHasLyrics) {
-        const ytmRes = ytmEarly || await ytmPromise;
-        const stillCurrent =
-          thisKey === currentKey &&
-          video_id === (currentLyricsVideoId || '') &&
-          requestId === activeLyricsRequestId;
+        // 上限で打ち切った回にここで待ち直すと、上の上限が無意味になる。
+        // 他に歌詞があるならそれを出して、YTM は届いた時に差し替える。
+        // 逆にどこからも歌詞が来ていないなら、YTM だけが頼りなので待つ。
+        if (ytmWaitTimedOut && backgroundHasLyrics) {
+          scheduleYtmLateUpgrade();
+        } else {
+          const ytmRes = ytmEarly || await ytmPromise;
+          const stillCurrent =
+            thisKey === currentKey &&
+            video_id === (currentLyricsVideoId || '') &&
+            requestId === activeLyricsRequestId;
 
-        if (ytmRes && ytmRes.hasSynced && stillCurrent) {
-          console.log(`[CS] YouTube Music を採用 (${preferYtm ? 'YTM優先' : 'LRCHubが空のためフォールバック'})`);
-          // フォールバックで採った場合は、あとから LRCHub が届いたら差し替えてよい
-          currentLyricsFromPreferredYtm = preferYtm;
-          res = {
-            ...res,
-            success: true,
-            lyrics: ytmRes.lyrics,
-            animated_lyrics: null,
-            dynamicLines: null,
-            lyricsSource: 'ytm',
-            fallbackUsed: !preferYtm,
-          };
+          // YTM が同期歌詞を持たない曲でも、歌詞テキスト自体は持っていることがある
+          // (実測: 曲の約2割は cueRange を持たない = モバイルでも時刻なしで表示される)。
+          // 以前はこれを丸ごと捨てていたため、「モバイルには歌詞があるのに
+          // 拡張では何も出ない」曲が生まれていた。他にどこからも歌詞が来ない
+          // ときの最後の受け皿として採用する。
+          const ytmHasPlain = !!(ytmRes && !ytmRes.hasSynced &&
+            typeof ytmRes.lyrics === 'string' && ytmRes.lyrics.trim());
+          const useYtm = !!ytmRes && stillCurrent && !backgroundHasSrv3 &&
+            (ytmRes.hasSynced || (ytmHasPlain && !backgroundHasLyrics));
+
+          if (useYtm) {
+            const synced = !!ytmRes.hasSynced;
+            YTMLog.log(`[CS] YouTube Music を採用 (${synced ? '同期' : '時刻なし'} / ${preferYtm ? 'YTM優先' : 'LRCHubが空のためフォールバック'})`);
+            // フォールバックで採った場合は、あとから LRCHub が届いたら差し替えてよい。
+            // 時刻なしの歌詞は同期歌詞に劣るので、YTM優先設定でも差し替えを許す。
+            currentLyricsFromPreferredYtm = preferYtm && synced;
+            res = {
+              ...res,
+              success: true,
+              lyrics: ytmRes.lyrics,
+              animated_lyrics: null,
+              dynamicLines: null,
+              lyricsSource: 'ytm',
+              fallbackUsed: !preferYtm || !synced,
+            };
+          }
         }
       }
     } catch (e) {
@@ -5753,6 +7564,69 @@ async function loadLyrics(meta, options = {}) {
 // Segmenter の生成は重いため1回だけ作って使い回す
 const _jaWordSegmenter = new Intl.Segmenter('ja', { granularity: 'word' });
 
+// ── 行の折り返し位置 ────────────────────────────────────────
+// 「を」「の」で行が始まったり、拗音が行頭に落ちたりしないように、
+// くっつけて良い所を判定する。同期ありの行と無しの行で判定が違うと
+// 同じ曲の中で折り返し方が変わってしまうので、両方ここを通す。
+const LYRIC_PHRASE_RULES = {
+  suffixes: new Set([
+    'て', 'に', 'を', 'は', 'が', 'の', 'へ', 'と', 'も', 'で', 'や', 'し', 'から', 'より', 'だけ', 'まで', 'こそ', 'さえ', 'でも', 'など', 'なら', 'くらい', 'ぐらい', 'ばかり',
+    'ね', 'よ', 'な', 'さ', 'わ', 'ぞ', 'ぜ', 'かしら', 'かな', 'かも', 'だし', 'もん', 'もの',
+    'って', 'けど', 'けれど', 'のに', 'ので', 'から', 'ため', 'よう', 'こと', 'もの', 'わけ', 'ほう', 'ところ', 'とおり',
+    'た', 'だ', 'ない', 'たい', 'ます', 'ません', 'う', 'よう', 'れる', 'られる', 'せる', 'させる', 'ん', 'ず',
+    'てた', 'てる', 'ちゃう', 'じゃん', 'なきゃ', 'なくちゃ', 'く', 'き', 'けれ', 'れば',
+    'った', 'たら', 'たり',
+    'か', 'かい', 'だい', 'いる', 'ある', 'くる', 'いく', 'みる', 'おく', 'しまう', 'ほしい', 'あげる', 'くれる', 'もらう',
+    '、', '。', '，', '．', '…', '・', '！', '？', '!', '?', '~', '～', '“', '”', '‘', '’', ')', ']', '}', '」', '』', '】', '）'
+  ]),
+  isEnglish: (w) => /^[a-zA-Z0-9'\-\.,!?:;]+$/.test(w),
+  isSpace: (w) => /^\s+$/.test(w),
+  isOpenParen: (w) => /^[\(\[\{「『（【]$/.test(w),
+  hasKanji: (w) => /[一-鿿]/.test(w),
+  isHiragana: (w) => /^[぀-ゟー]+$/.test(w),
+  isKatakana: (w) => /^[゠-ヿー]+$/.test(w),
+  startsWithSmallKana: (w) => /^[ぁぃぅぇぉっゃゅょゎゕゖ]/.test(w),
+};
+
+const shouldMergeLyricSegments = (word, nextWord) => {
+  if (!nextWord) return false;
+  const r = LYRIC_PHRASE_RULES;
+  // 開き括弧は次の語に付く。閉じ括弧は suffixes にあって前の語に付くが、
+  // 開き括弧には相棒が無く、単独のまとまりとして行末に取り残されていた。
+  // 「君を知りたい(」で折り返して次の行が「君を知りたい)」になる。
+  if (r.isOpenParen(word)) return true;
+  if (r.startsWithSmallKana(nextWord)) return true;
+  if (r.suffixes.has(nextWord)) return !r.isOpenParen(nextWord);
+  if (r.hasKanji(word) && r.isHiragana(nextWord)) return true;
+  if (r.isKatakana(word) && r.isKatakana(nextWord)) return true;
+  if ((r.isEnglish(word) || r.isSpace(word)) &&
+    (r.isEnglish(nextWord) || r.isSpace(nextWord))) return true;
+  return false;
+};
+
+// 同期ありの行は語ごとの span に分かれている。そのままだと語と語の
+// どこでも折り返せてしまい、「を」だけが行頭に落ちる。
+// 同じ規則でまとめて、まとまりの中では折り返させない。
+const groupLyricUnitsIntoPhrases = (units) => {
+  const phrases = [];
+  let current = null;
+
+  for (let i = 0; i < units.length; i++) {
+    if (!current) {
+      current = [];
+      phrases.push(current);
+    }
+    current.push(units[i]);
+
+    const next = units[i + 1];
+    if (!next) break;
+    if (shouldMergeLyricSegments(units[i].text, next.text)) continue;
+    current = null;
+  }
+
+  return phrases;
+};
+
 const optimizeLineBreaks = (text) => {
   if (!text) return '';
 
@@ -5761,30 +7635,8 @@ const optimizeLineBreaks = (text) => {
   let html = '';
   let buffer = '';
 
-  const rules = {
-    suffixes: new Set([
-      'て', 'に', 'を', 'は', 'が', 'の', 'へ', 'と', 'も', 'で', 'や', 'し', 'から', 'より', 'だけ', 'まで', 'こそ', 'さえ', 'でも', 'など', 'なら', 'くらい', 'ぐらい', 'ばかり',
-      'ね', 'よ', 'な', 'さ', 'わ', 'ぞ', 'ぜ', 'かしら', 'かな', 'かも', 'だし', 'もん', 'もの',
-      'って', 'けど', 'けれど', 'のに', 'ので', 'から', 'ため', 'よう', 'こと', 'もの', 'わけ', 'ほう', 'ところ', 'とおり',
-      'た', 'だ', 'ない', 'たい', 'ます', 'ません', 'う', 'よう', 'れる', 'られる', 'せる', 'させる', 'ん', 'ず',
-      'てた', 'てる', 'ちゃう', 'じゃん', 'なきゃ', 'なくちゃ', 'く', 'き', 'けれ', 'れば',
-      'った', 'たら', 'たり',
-      'か', 'かい', 'だい', 'いる', 'ある', 'くる', 'いく', 'みる', 'おく', 'しまう', 'ほしい', 'あげる', 'くれる', 'もらう',
-      '、', '。', '，', '．', '…', '・', '！', '？', '!', '?', '~', '～', '“', '”', '‘', '’', ')', ']', '}', '」', '』', '】', '）'
-    ]),
-
-    isEnglish: (w) => /^[a-zA-Z0-9'\-\.,!?:;]+$/.test(w),
-    isSpace: (w) => /^\s+$/.test(w),
-    isOpenParen: (w) => /^[\(\[\{「『（【]$/.test(w),
-    hasKanji: (w) => /[\u4E00-\u9FFF]/.test(w),
-    isHiragana: (w) => /^[\u3040-\u309F\u30FC]+$/.test(w),
-    isKatakana: (w) => /^[\u30A0-\u30FF\u30FC]+$/.test(w),
-    startsWithSmallKana: (w) => /^[\u3041\u3043\u3045\u3047\u3049\u3063\u3083\u3085\u3087\u308E\u3095\u3096]/.test(w)
-  };
-
   for (let i = 0; i < segments.length; i++) {
-    const seg = segments[i];
-    const word = seg.segment;
+    const word = segments[i].segment;
     const next = segments[i + 1];
 
     buffer += word;
@@ -5794,32 +7646,7 @@ const optimizeLineBreaks = (text) => {
       break;
     }
 
-    const nextWord = next.segment;
-    let shouldMerge = false;
-
-    if (rules.startsWithSmallKana(nextWord)) {
-      shouldMerge = true;
-    }
-    else if (rules.suffixes.has(nextWord)) {
-      if (!rules.isOpenParen(nextWord)) {
-        shouldMerge = true;
-      }
-    }
-
-    else if (rules.hasKanji(word) && rules.isHiragana(nextWord)) {
-      shouldMerge = true;
-    }
-    else if (rules.isKatakana(word) && rules.isKatakana(nextWord)) {
-      shouldMerge = true;
-    }
-    else if ((rules.isEnglish(word) || rules.isSpace(word)) &&
-      (rules.isEnglish(nextWord) || rules.isSpace(nextWord))) {
-      shouldMerge = true;
-    }
-
-    if (shouldMerge) {
-      continue;
-    }
+    if (shouldMergeLyricSegments(word, next.segment)) continue;
 
     html += `<span class="lyric-phrase">${buffer}</span>`;
     buffer = '';
@@ -5835,7 +7662,7 @@ function renderLyrics(data) {
   // 再描画によるscrollイベントをユーザースクロール扱いにしない
   suppressUserScrollDetection(500);
   ui.lyrics.innerHTML = '';
-  ui.lyrics.scrollTop = 0;
+  resetLyricScrollState(ui.lyrics);
   // 再描画後は前回のハイライト/スクロール状態が無効になるためリセットし、
   // 次回の自動スクロールは現在の再生位置へ「即時」ジャンプさせる
   // （曲の途中で歌詞が再描画された際、0秒位置のまま止まる問題の修正）
@@ -5856,6 +7683,15 @@ function renderLyrics(data) {
   const fragment = document.createDocumentFragment();
   const usedMainDynamicIndices = new Set();
   const usedSubDynamicIndices = new Set();
+
+  // Apple Music 風は語ごとの span、従来式は1文字ずつの span。
+  // DOM の作りが違うので、設定が変わったら描き直す必要がある
+  // (設定保存側で applyLyricsText を呼び直している)。
+  // 低負荷モードでは従来式に落とす。毎フレームの塗り替えは
+  // そもそも負荷を削りたい人向けではない。
+  // 軽量モードでも文字同期を動かす。合成側に載っているので負荷の主因ではない
+  // (applyAppleSyncClass の注釈を参照)。軽くするのは光だけ。
+  const useWordSync = !!config.appleSyncStyle;
 
   data.forEach((line, index) => {
     const row = createEl('div', '', 'lyric-line');
@@ -5930,7 +7766,49 @@ function renderLyrics(data) {
       }
     }
 
-    if (dyn && Array.isArray(dyn.chars) && dyn.chars.length) {
+    const lineEndSec = (typeof line?._dynamicRenderEndSec === 'number')
+      ? line._dynamicRenderEndSec
+      : null;
+
+    if (dyn && Array.isArray(dyn.chars) && dyn.chars.length && useWordSync) {
+      // Apple Music 風: 語ごとに span を立てる。語の中の字形はブラウザに
+      // そのまま組ませるので、字の間に隙間が出ない。
+      const wordSpans = [];
+      const units = buildLyricWordUnits(dyn.chars, lineEndSec);
+      for (const phrase of groupLyricUnitsIntoPhrases(units)) {
+        // まとまりごとに inline-block で包む。折り返せるのはこの外側だけ。
+        const phraseSpan = createEl('span', '', 'lyric-phrase lyric-phrase-sync');
+        for (const unit of phrase) {
+          if (unit.type === 'space') {
+            phraseSpan.appendChild(document.createTextNode(unit.text));
+            continue;
+          }
+          if (!unit.text) continue;
+          const wordSpan = createEl('span', '', 'lyric-word');
+          wordSpan.textContent = unit.text;
+          wordSpan._times = unit.times;
+          wordSpan._offsets = unit.offsets;
+          wordSpan._start = unit.start;
+          wordSpan._end = unit.end;
+          wordSpan._emp = false;
+          // PIP は innerHTML で複製するので JS のプロパティが消える。
+          // 向こうで組み直せるように、時刻は属性にも書いておく。
+          wordSpan.dataset.wt = unit.times
+            .map(t => (t === null ? '' : t.toFixed(3))).join(',');
+          if (Number.isFinite(unit.end)) wordSpan.dataset.we = unit.end.toFixed(3);
+          phraseSpan.appendChild(wordSpan);
+          wordSpans.push(wordSpan);
+        }
+        if (phraseSpan.childNodes.length) mainSpan.appendChild(phraseSpan);
+      }
+      if (wordSpans.length) {
+        row._ytmWordSpans = wordSpans;
+        row.classList.add('ytm-word-sync');
+      } else {
+        mainSpan.textContent = '';
+        mainSpan.innerHTML = optimizeLineBreaks(line ? line.text : '');
+      }
+    } else if (dyn && Array.isArray(dyn.chars) && dyn.chars.length) {
       const charSpans = [];
       dyn.chars.forEach((ch, ci) => {
         const chSpan = createEl('span', '', 'lyric-char');
@@ -5946,6 +7824,13 @@ function renderLyrics(data) {
         chSpan.classList.add('char-pending');
         mainSpan.appendChild(chSpan);
         charSpans.push(chSpan);
+      });
+      charSpans.forEach((sp, ci) => {
+        const next = charSpans[ci + 1];
+        const end = next ? next._ytmTime : lineEndSec;
+        sp._ytmEnd = (Number.isFinite(end) && end > sp._ytmTime)
+          ? end
+          : sp._ytmTime + CHAR_DEFAULT_SPAN_SEC;
       });
       row._ytmCharSpans = charSpans;
     } else {
@@ -5982,13 +7867,24 @@ function renderLyrics(data) {
   });
 
   ui.lyrics.appendChild(fragment);
+  if (useWordSync) {
+    prefetchLyricLineSweeps(Array.from(ui.lyrics.querySelectorAll('.lyric-line.ytm-word-sync')));
+  }
 
   if (PipManager.pipWindow && PipManager.pipLyricsContainer) {
     PipManager.pipLyricsContainer.innerHTML = ui.lyrics.innerHTML;
+    if (useWordSync) {
+      // PIP は幅が違うので語の横位置も違う。向こうの文書で測り直す。
+      prefetchLyricLineSweeps(
+        Array.from(PipManager.pipLyricsContainer.querySelectorAll('.lyric-line.ytm-word-sync')),
+      );
+    }
     if (PipManager.pipWindow.document) {
       // 歌詞が無い曲は PIP でも歌詞エリアごと畳む（通常ウィンドウと同じ扱い）
       PipManager.pipWindow.document.body.classList.toggle('ytm-no-lyrics', !hasData);
       PipManager.pipWindow.document.body.classList.toggle('ytm-no-timestamp', !hasTimestamp);
+      PipManager.pipWindow.document.body.classList.remove('ytm-animated-caption-mode');
+      PipManager.pipWindow.document.body.classList.toggle('ytm-keep-past-lyrics', !!config.keepPastLyrics);
       PipManager.pipWindow.document.body.classList.toggle('ytm-singer-colors-enabled', !!config.useSingerColors);
     }
   }
@@ -6039,6 +7935,117 @@ const restartLyricRafLoop = () => {
 };
 window.restartLyricRafLoop = restartLyricRafLoop;
 
+// ── 行送りのスクロール ──────────────────────────────────
+// ブラウザ内蔵の smooth スクロールは、動いている途中で次の行が来ると
+// いまの動きを打ち切って新しい動きを始める。そこで速度が跳ねるので、
+// 行がつぎつぎ変わる所ほどつっかえて見える。
+// 自前のばねで動かすと、目標が変わっても今の速度のまま繋がる。
+// 行き過ぎて戻らないよう臨界減衰(damping = 2√stiffness)にしてある。
+const SCROLL_STIFFNESS = 120;
+const SCROLL_DAMPING = 2 * Math.sqrt(SCROLL_STIFFNESS);
+// これ以下になったら止める。残りコンマ数 px を延々と詰めない。
+const SCROLL_SETTLE_PX = 0.5;
+const SCROLL_SETTLE_VEL = 8;
+// 自分が書いた位置からこれ以上ずれていたら、誰かが動かしたとみなして譲る
+const SCROLL_HANDOVER_PX = 4;
+
+const snapLyricScroll = (container) => {
+  if (!container || container._scrollTarget === undefined) return;
+  container.scrollTop = container._scrollTarget;
+  // 書いた値ではなく、丸められた実際の値を覚える。
+  // scrollTop は 0〜(scrollHeight - clientHeight) に丸められる。中央合わせの
+  // 行き先は曲頭と曲末で範囲の外に出る(上下の余白 30vh に対し中央は
+  // clientHeight/2 = 32.5vh。行が 5vh より低いと、1行目の行き先が負になる)。
+  // ここで丸める前の値を覚えると、以後 stepLyricScroll の「誰かが動かした」
+  // 判定が毎フレーム成立して、追従が二度と動かなくなる。
+  // 歌詞をクリックすると後方シークになり即時ジャンプでここを通るので、
+  // 曲頭の行を選ぶとその曲のあいだ自動スクロールが死んでいた。
+  container._scrollPos = container.scrollTop;
+  container._scrollLastWritten = container.scrollTop;
+  container._scrollVel = 0;
+  container._scrollTarget = undefined;
+};
+
+// 先頭へ戻す時など、ばねの外から scrollTop を書く場合はこれを通す。
+// 記録を残したまま書き換えると、次のフレームで「誰かが動かした」と
+// 誤判定して追従が止まる。
+const resetLyricScrollState = (container, top = 0) => {
+  if (!container) return;
+  container.scrollTop = top;
+  container._scrollTarget = undefined;
+  container._scrollVel = 0;
+  container._scrollPos = container.scrollTop;
+  container._scrollLastWritten = container.scrollTop;
+};
+
+const requestLyricScroll = (container, target, instant) => {
+  if (!container) return;
+  if (instant) {
+    container._scrollTarget = target;
+    snapLyricScroll(container);
+    return;
+  }
+  // 前回自分が書いた位置から離れていたら、ユーザーが動かしたか
+  // レイアウトが変わったということ。そこから引き継ぐ。
+  const written = container._scrollLastWritten;
+  if (written === undefined || Math.abs(container.scrollTop - written) > SCROLL_HANDOVER_PX) {
+    container._scrollPos = container.scrollTop;
+    container._scrollVel = 0;
+  }
+  container._scrollTarget = target;
+};
+
+const stepLyricScroll = (container, dt) => {
+  if (!container || container._scrollTarget === undefined) return;
+
+  // 動かしている最中にユーザーが触ったら、そちらを優先して手を引く
+  if (container._scrollLastWritten !== undefined &&
+    Math.abs(container.scrollTop - container._scrollLastWritten) > SCROLL_HANDOVER_PX) {
+    container._scrollTarget = undefined;
+    container._scrollVel = 0;
+    // 途中で手を引いたなら、その行へは行き着いていない。
+    // 「スクロール済み」の印を戻して次のフレームで出し直せるようにする。
+    // これが無いと、翻訳の到着で行の高さが変わるなど、ユーザー操作以外で
+    // scrollTop が動いた回に、次の行が来るまで追従が止まる。
+    // 本当にユーザーが掴んでいる時は下の isUserScrolling で弾かれ、
+    // 手を離して 3 秒すればどのみち印は戻る。
+    container._lastScrolledIndex = -1;
+    return;
+  }
+
+  const target = container._scrollTarget;
+  let pos = container._scrollPos ?? container.scrollTop;
+  let vel = container._scrollVel || 0;
+  const diff = pos - target;
+
+  if (Math.abs(diff) < SCROLL_SETTLE_PX && Math.abs(vel) < SCROLL_SETTLE_VEL) {
+    snapLyricScroll(container);
+    return;
+  }
+
+  vel += (-SCROLL_STIFFNESS * diff - SCROLL_DAMPING * vel) * dt;
+  pos += vel * dt;
+
+  container._scrollPos = pos;
+  container._scrollVel = vel;
+  container.scrollTop = pos;
+  container._scrollLastWritten = container.scrollTop;
+
+  // 自分で動かしているぶんの scroll イベントを、ユーザー操作と
+  // 取り違えられないようにしておく(どちらの判定もこれを最初に見る)。
+  container._suppressUserScrollUntil = performance.now() + 220;
+  if (container === ui.lyrics) suppressUserScrollDetection(220);
+};
+
+let _lastScrollStepAt = 0;
+const stepLyricScrolls = (nowMs) => {
+  const dt = _lastScrollStepAt ? Math.min(0.05, (nowMs - _lastScrollStepAt) / 1000) : 0;
+  _lastScrollStepAt = nowMs;
+  if (dt <= 0) return;
+  stepLyricScroll(ui.lyrics, dt);
+  stepLyricScroll(PipManager.pipLyricsContainer, dt);
+};
+
 function startLyricRafLoop() {
   if (isRafLoopRunning) return;
   isRafLoopRunning = true;
@@ -6046,9 +8053,16 @@ function startLyricRafLoop() {
   _cachedVideoEl = null;
   // 停止中に曲が変わっている可能性があるため、巻き戻り検出の基準をリセット
   _lastRafPlaybackTime = -1;
+  // 一時停止をまたぐと「止まっていた間の実時間」が補間に乗ってしまう
+  resetPlaybackClock();
+
+  _lastScrollStepAt = 0;
 
   const loop = () => {
     const v = _cachedVideoEl || (_cachedVideoEl = document.querySelector('video'));
+    // rAF が渡す時刻は使わない。PIP を開くとループが向こうの窓の
+    // requestAnimationFrame に移り、時刻の原点が変わってしまう。
+    stepLyricScrolls(performance.now());
 
     if (v) {
       if (PipManager.pipWindow) {
@@ -6059,7 +8073,10 @@ function startLyricRafLoop() {
       document.body.classList.toggle('ytm-music-paused', !isPlaying);
 
       if (isPlaying) {
-        let t = v.currentTime;
+        _playbackRateForMotion = (Number.isFinite(v.playbackRate) && v.playbackRate > 0)
+          ? v.playbackRate
+          : 1;
+        let t = readSmoothPlaybackTime(v);
         const duration = v.duration || 1;
 
         // 連続再生（曲が変わっても currentTime がリセットされない）対応:
@@ -6109,9 +8126,18 @@ function startLyricRafLoop() {
           lyricRafId = requestAnimationFrame(loop);
         }
       } else {
+        // 止まっている間はループが回らない。中途半端な位置で残らないよう着地させる。
+        snapLyricScroll(ui.lyrics);
+        snapLyricScroll(PipManager.pipLyricsContainer);
+        // 文字の動きは合成側の時計で走っているので、明示的に止めないと
+        // 一時停止中も歌詞だけ動き続ける。
+        pauseAllLyricWordMotion();
         isRafLoopRunning = false;
       }
     } else {
+      snapLyricScroll(ui.lyrics);
+      snapLyricScroll(PipManager.pipLyricsContainer);
+      pauseAllLyricWordMotion();
       isRafLoopRunning = false;
     }
   };
@@ -6124,6 +8150,16 @@ function startLyricRafLoop() {
     lyricRafId = requestAnimationFrame(loop);
   }
 }
+
+// 窓の大きさが変わると語の横位置が動く。次に主役になった時に測り直させる。
+let _sweepResizeTimer = null;
+window.addEventListener('resize', () => {
+  if (_sweepResizeTimer) clearTimeout(_sweepResizeTimer);
+  _sweepResizeTimer = setTimeout(() => {
+    _sweepResizeTimer = null;
+    invalidateLyricLineSweeps();
+  }, 200);
+});
 
 document.addEventListener('play', (e) => {
   if (e.target.tagName === 'VIDEO') {
@@ -6153,7 +8189,83 @@ let _lastLikeCheckTime = 0;
 let _suppressUserScrollUntil = 0;
 // 再生時間の大幅な巻き戻り（曲切替/シーク）検出用
 let _lastRafPlaybackTime = -1;
-// 現在の描画に1文字同期(dynamic)の時間レンジが存在するか（毎フレームの全行走査を省くため）
+
+// ── 再生位置の補間 ────────────────────────────────────────
+// video.currentTime は毎フレーム進むわけではない。YouTube Music が流すのは
+// 実質音声だけのストリームで、currentTime は音声バッファのコールバック単位に
+// まとめて進む(実測で数十 ms おき)。rAF は 60fps で回るので、そのまま使うと
+// 同じ値が数フレーム続いたあと一段飛ぶ = 階段状の時間になる。
+//
+// 従来の「時刻を過ぎたら点灯」ではこの段差は見えなかった。1文字が数十 ms
+// 遅れて点いても分からないため。塗りを連続にした途端に段差がそのまま
+// 目に見えるようになった。
+//
+// やっていること:
+//   1. 自前の時計をフレーム間の実経過時間ぶんだけ進める(ここが滑らかさの本体)
+//   2. currentTime から作った推定値へ、毎フレームごくわずかだけ引き寄せる
+// 2 を一気にやると段差が戻ってくる。currentTime 由来の推定値は
+// 「更新されるまで古い値のまま」なので、それ自体がノコギリ状に揺れていて、
+// そのまま採用すると 10ms 前後の凸凹が残る。少しずつ吸収して均す。
+let _clockRawTime = -1;   // 最後に観測した currentTime そのもの
+let _clockRawAt = 0;      // それを観測した performance.now()
+let _clockOutTime = -1;   // 直前に返した推定値
+let _clockOutAt = 0;      // それを返した performance.now()
+
+// currentTime が止まっている間に推定値を進めてよい上限。
+// バッファ切れ等で本当に止まった時、時計だけ走り続けるのを防ぐ。
+const CLOCK_MAX_EXTRAPOLATION_SEC = 0.2;
+// 推定値とのズレがこれを超えたらシーク・曲送りとみなして合わせ直す
+const CLOCK_RESYNC_SEC = 0.35;
+// 1フレームで吸収するズレの割合。小さいほど滑らかで、追従は遅くなる。
+const CLOCK_CORRECTION = 0.12;
+// 推定値からどこまで離れることを許すか。先走りは音より先に光るので厳しめ。
+const CLOCK_MAX_LEAD_SEC = 0.08;
+const CLOCK_MAX_LAG_SEC = 0.15;
+
+const resetPlaybackClock = () => {
+  _clockRawTime = -1;
+  _clockRawAt = 0;
+  _clockOutTime = -1;
+  _clockOutAt = 0;
+};
+
+const readSmoothPlaybackTime = (v) => {
+  const raw = v.currentTime;
+  if (!Number.isFinite(raw)) return raw;
+
+  const now = (typeof performance !== 'undefined' && performance.now)
+    ? performance.now()
+    : Date.now();
+  const rate = (Number.isFinite(v.playbackRate) && v.playbackRate > 0) ? v.playbackRate : 1;
+
+  if (raw !== _clockRawTime) {
+    _clockRawTime = raw;
+    _clockRawAt = now;
+  }
+
+  // currentTime は「最後に更新された時点では正確」。そこからの実経過を足す。
+  const target = raw + Math.min(
+    (now - _clockRawAt) / 1000 * rate,
+    CLOCK_MAX_EXTRAPOLATION_SEC,
+  );
+
+  if (_clockOutTime < 0 || Math.abs(target - _clockOutTime) > CLOCK_RESYNC_SEC) {
+    // 初回・シーク・曲送り・タブが止まっていた後。素直に合わせ直す。
+    _clockOutTime = target;
+    _clockOutAt = now;
+    return _clockOutTime;
+  }
+
+  const predicted = _clockOutTime + (now - _clockOutAt) / 1000 * rate;
+  let out = predicted + (target - predicted) * CLOCK_CORRECTION;
+  if (out > target + CLOCK_MAX_LEAD_SEC) out = target + CLOCK_MAX_LEAD_SEC;
+  if (out < target - CLOCK_MAX_LAG_SEC) out = target - CLOCK_MAX_LAG_SEC;
+
+  _clockOutTime = out;
+  _clockOutAt = now;
+  return out;
+};
+
 let _hasDynamicRenderRanges = false;
 // アクティブ行に1文字同期スパンが含まれるか。trueの間のみ毎フレームのDOM更新が必要。
 // 安全側に倒して初期値はtrue（次のフレームで実態に合わせて更新される）
@@ -6162,6 +8274,11 @@ let _activeRowsHaveCharSpans = true;
 function suppressUserScrollDetection(ms = 500) {
   _suppressUserScrollUntil = performance.now() + ms;
 }
+
+// 動きは合成側の時計で走るので、倍速再生に付いていくために
+// 再生速度を渡す必要がある。毎フレーム video を読み直さずに済むよう、
+// rAF ループが更新した値をここで使う。
+let _playbackRateForMotion = 1;
 
 function updateLyricHighlight(currentTime) {
   if (!lyricsData.length) return;
@@ -6199,10 +8316,14 @@ function updateLyricHighlight(currentTime) {
 
   const activeIndices = new Set();
   if (idx >= 0 && idx < lyricsData.length) {
-    activeIndices.add(idx);
+    const primaryLine = lyricsData[idx];
+    const primaryHasDynamicRange = Number.isFinite(primaryLine?._dynamicRenderStartSec) &&
+      Number.isFinite(primaryLine?._dynamicRenderEndSec);
+    const primaryIsActive = isPrimaryRowLitAtTime(lyricsData, idx, t);
+    if (primaryIsActive) activeIndices.add(idx);
 
     const currentLineTime = lyricsData[idx]?.time;
-    if (typeof currentLineTime === 'number') {
+    if (primaryIsActive && typeof currentLineTime === 'number') {
       for (let i = idx - 1; i >= 0; i--) {
         if (!isSameTimestamp(lyricsData[i]?.time, currentLineTime)) break;
         activeIndices.add(i);
@@ -6213,7 +8334,7 @@ function updateLyricHighlight(currentTime) {
       }
     }
 
-    if (activeIndices.size === 1) {
+    if (primaryIsActive && activeIndices.size === 1) {
       const prevIdx = (idx > 0 && idx < lyricsData.length &&
         typeof lyricsData[idx]?.time === 'number' &&
         typeof lyricsData[idx - 1]?.time === 'number' &&
@@ -6300,7 +8421,18 @@ function updateLyricHighlight(currentTime) {
       if (!r.classList.contains('lyric-line')) continue;
       const isActive = activeIndices.has(i);
       const isPrimary = (i === idx);
-      const isPast = idx >= 0 && i < idx && !isActive;
+      // 歌い終わった行は active を外す(歌っていないのに光っていたら嘘)。
+      // ただし past にはしない。past は不可視なので、次の行が始まるまでの
+      // 間ずっと画面から歌詞が消える。
+      //
+      // 終わり時刻を持つのは文字同期の行だけなので、この差は「同期が細かい
+      // 曲ほど画面が空になる」という逆転になっていた。実測: Dear
+      // (Mrs. GREEN APPLE) は行間の空きが歌っている時間の6割あり
+      // (歌 166秒 / 空き 101秒)、点いて消えて点いて消えて、に見えた。
+      //
+      // 次の行が始まれば idx が進み、この行は i < idx で past になる。
+      // 消える時機が「自分が終わった時」から「次が始まる時」に変わるだけ。
+      const isPast = idx >= 0 && !isActive && i < idx;
       r.classList.toggle('lyric-past', isPast);
 
       if (isActive) {
@@ -6316,10 +8448,12 @@ function updateLyricHighlight(currentTime) {
           // 再描画直後・大幅シーク後は現在位置へ即時ジャンプ（0秒位置からの
           // ゆっくりスクロールを防ぐ）
           const scrollBehavior = container._instantNextScroll ? 'auto' : 'smooth';
-          container._instantNextScroll = false;
 
           if (container === ui.lyrics) {
+            // 見送る回で _instantNextScroll を消さない。消すと、次に動ける
+            // ようになった時に 0 秒位置からゆっくり流れてしまう。
             if (isUserScrolling) continue;
+            container._instantNextScroll = false;
             // 【通常再生画面】
             // getBoundingClientRect を使って要素の絶対位置から確実なスクロール量を計算
             const containerRect = container.getBoundingClientRect();
@@ -6333,20 +8467,21 @@ function updateLyricHighlight(currentTime) {
             programmaticScrollMaxTimeout = setTimeout(() => { isProgrammaticScrolling = false; }, 1200);
             if (scrollBehavior === 'auto') suppressUserScrollDetection(300);
 
-            container.scrollTo({ top: targetScroll, behavior: scrollBehavior });
+            requestLyricScroll(container, targetScroll, scrollBehavior === 'auto');
 
             container._lastScrolledIndex = idx;
             ReplayManager.incrementLyricCount();
           } else {
             // 【PIP（小窓）】
             if (container._isUserScrolling) continue;
+            container._instantNextScroll = false;
 
             const containerRect = container.getBoundingClientRect();
             const rRect = r.getBoundingClientRect();
             const targetScroll = container.scrollTop + rRect.top - containerRect.top - (container.clientHeight * 0.35) + (rRect.height / 2);
 
             container._isProgrammaticScrolling = true;
-            container.scrollTo({ top: targetScroll, behavior: scrollBehavior });
+            requestLyricScroll(container, targetScroll, scrollBehavior === 'auto');
 
             container._lastScrolledIndex = idx;
           }
@@ -6354,37 +8489,52 @@ function updateLyricHighlight(currentTime) {
 
         // char-level アニメーション（アクティブ行のみ、毎フレーム必要）
         // 行要素にキャッシュした配列を使う（毎フレームの querySelectorAll を回避）
-        let charSpans = r._ytmCharSpans;
-        if (!charSpans) charSpans = r._ytmCharSpans = Array.from(r.querySelectorAll('.lyric-char'));
-        if (charSpans.length > 0) {
+        // PIP の行は複製なので _ytmWordSpans を持たない。クラスで見分けて
+        // 一度だけ組み直す(rehydrate は paintLyricWordRow の中でやる)。
+        const isWordSync = r._ytmWordSpans
+          ? r._ytmWordSpans.length > 0
+          : r.classList.contains('ytm-word-sync');
+        if (isWordSync) {
           sawActiveCharSpans = true;
-          charSpans.forEach(sp => {
-            const tt = (sp._ytmTime !== undefined) ? sp._ytmTime : (sp._ytmTime = parseFloat(sp.dataset.time || '0'));
-            if (Number.isFinite(tt) && tt <= t) {
-              if (!sp.classList.contains('char-active')) {
-                sp.classList.add('char-active');
-                sp.classList.remove('char-pending');
+          paintLyricWordRow(r, t, _playbackRateForMotion);
+        } else {
+          let charSpans = r._ytmCharSpans;
+          if (!charSpans) charSpans = r._ytmCharSpans = Array.from(r.querySelectorAll('.lyric-char'));
+          if (charSpans.length > 0) {
+            sawActiveCharSpans = true;
+            charSpans.forEach(sp => {
+              if (sp._ytmTime === undefined) sp._ytmTime = parseFloat(sp.dataset.time || '0');
+              const tt = sp._ytmTime;
+              if (Number.isFinite(tt) && tt <= t) {
+                if (!sp.classList.contains('char-active')) {
+                  sp.classList.add('char-active');
+                  sp.classList.remove('char-pending');
+                }
+              } else {
+                if (!sp.classList.contains('char-pending')) {
+                  sp.classList.remove('char-active');
+                  sp.classList.add('char-pending');
+                }
               }
-            } else {
-              if (!sp.classList.contains('char-pending')) {
-                sp.classList.remove('char-active');
-                sp.classList.add('char-pending');
-              }
-            }
-          });
+            });
+          }
         }
       } else if (activeChanged && _previousActiveIndices.has(i)) {
         // 状態遷移: active→非active になった行のみリセット
         r.classList.remove('active');
         r.classList.remove('show-translation');
 
-        let charSpans = r._ytmCharSpans;
-        if (!charSpans) charSpans = r._ytmCharSpans = Array.from(r.querySelectorAll('.lyric-char'));
-        if (charSpans.length > 0) {
-          charSpans.forEach(sp => {
-            sp.classList.remove('char-active');
-            sp.classList.add('char-pending');
-          });
+        if (r.classList.contains('ytm-word-sync')) {
+          resetLyricWordRow(r);
+        } else {
+          let charSpans = r._ytmCharSpans;
+          if (!charSpans) charSpans = r._ytmCharSpans = Array.from(r.querySelectorAll('.lyric-char'));
+          if (charSpans.length > 0) {
+            charSpans.forEach(sp => {
+              sp.classList.remove('char-active');
+              sp.classList.add('char-pending');
+            });
+          }
         }
       }
     }
@@ -6507,6 +8657,9 @@ const tick = async () => {
   const isPlayerOpen = layout?.hasAttribute('player-page-open');
   if (!config.mode || !isPlayerOpen) {
     document.body.classList.remove('ytm-custom-layout');
+    // Immersion を閉じている間は再生位置を追えていない。
+    // 次に開いた時、曲の切り替わりを見ていたことにしてはいけない。
+    _wasTrackingPlayback = false;
     return;
   }
   document.body.classList.add('ytm-custom-layout');
@@ -6532,6 +8685,9 @@ const tick = async () => {
 
   const meta = getMetadata();
   if (!meta) return;
+  // 「直前の tick でも追えていたか」を、フラグを更新する前に控える
+  const wasTrackingBefore = _wasTrackingPlayback;
+  _wasTrackingPlayback = true;
   const key = `${meta.title}///${meta.artist}`;
   const videoId = getCurrentVideoId() || '';
 
@@ -6555,7 +8711,13 @@ const tick = async () => {
     // offset として引くことで曲内の正しい再生位置を得る。
     //  ・初回ロード（最初の曲 / 途中再生）は offset 不要（currentTime がそのまま曲内時間）
     //  ・リセット再生（currentTime が 0 に戻る）の場合は RAF ループ側で offset を自動解除
-    if (isInitialLoad) {
+    //  ・Immersion を曲の途中で開いた場合は、この時点の currentTime は
+    //    「新しい曲が始まった video 時間」ではなく「今聴いている位置」。
+    //    これを offset にすると曲内時間が 0 に潰れ、歌詞が頭から流れてしまう
+    //    (シークしてから Immersion を開くとズレる、という不具合の原因)。
+    //    直前まで実際に再生を追えていた時だけ、連続再生の補正を適用する。
+    const sawTransition = wasTrackingBefore && !isInitialLoad;
+    if (!sawTransition) {
       timeOffset = 0;
     } else if (Number.isFinite(currentTime) && currentTime >= 5) {
       timeOffset = currentTime;
@@ -6586,9 +8748,7 @@ const tick = async () => {
     currentLyricsResultPriority = 0;
     currentLyricsQuality = 0;
     currentLyricsSource = null;
-    isFallbackLyrics = false;
     lyricsApplyEpoch += 1;
-    hideFallbackNotice();
     summaryButtonAttentionKey = null;
     lyricsData = [];
     animatedCaptionData = null;
@@ -6654,7 +8814,7 @@ const tick = async () => {
 
     refreshCandidateMenu();
     refreshLockMenu();
-    if (ui.lyrics) ui.lyrics.scrollTop = 0;
+    resetLyricScrollState(ui.lyrics);
     setTimeout(() => {
       if (currentKey !== key) return;
       if ((currentLyricsVideoId || '') !== videoId || (getCurrentVideoId() || '') !== videoId) return;
@@ -6667,11 +8827,19 @@ const tick = async () => {
   }
 };
 
+// 背景に使う画像の読み込み世代。
+// 曲が変わっても前の画像の読み込みは止まらない(DOM から外しても onload は
+// 発火する)。前の画像が遅れて読み終わると、新しい背景を古いもので塗り潰す。
+// アートワーク本体は replaceChildren で即座に入れ替わるので、
+// 「背景だけ前の曲のまま」になる。世代を持たせて古い分を捨てる。
+let _bgLoadToken = 0;
+
 function updateMetaUI(meta) {
   ui.title.innerText = meta.title;
   ui.artist.innerText = meta.artist;
 
   if (meta.src) {
+    const bgToken = ++_bgLoadToken;
     const img = document.createElement('img');
     img.crossOrigin = 'anonymous';
     if (meta.src.startsWith('data:') || meta.src.startsWith('blob:')) {
@@ -6686,6 +8854,7 @@ function updateMetaUI(meta) {
       }
     }
     img.onload = () => {
+      if (bgToken !== _bgLoadToken) return;   // もう次の曲になっている
       try {
         const canvas = document.createElement('canvas');
         canvas.width = 64;
@@ -6701,6 +8870,7 @@ function updateMetaUI(meta) {
       }
     };
     img.onerror = () => {
+      if (bgToken !== _bgLoadToken) return;
       ui.bg.style.backgroundImage = `url(${meta.src})`;
     };
     ui.artwork.replaceChildren(img);
@@ -6769,6 +8939,8 @@ const runtimeSettingsReady = (async function applySavedRuntimeSettings() {
     savedSourceMode,
     savedAnimatedCaptions,
     savedSingerColors,
+    savedAppleSync,
+    savedSourceBadge,
   ] = await Promise.all([
     storage.get('ytm_sync_offset'),
     storage.get('ytm_save_sync_offset'),
@@ -6776,14 +8948,20 @@ const runtimeSettingsReady = (async function applySavedRuntimeSettings() {
     storage.get('ytm_lyric_source_mode'),
     storage.get('ytm_animated_captions_enabled'),
     storage.get('ytm_singer_colors_enabled'),
+    storage.get('ytm_apple_sync_style'),
+    storage.get('ytm_lyrics_source_badge'),
   ]);
   if (savedOffset !== null && Number.isFinite(Number(savedOffset))) config.syncOffset = Number(savedOffset);
   if (savedOffsetEnabled !== null) config.saveSyncOffset = !!savedOffsetEnabled;
   config.useLrcLibFallback = true;
   config.lyricSourceMode = normalizeSourceMode(savedSourceMode);
   if (savedAnimatedCaptions !== null) config.useAnimatedCaptions = !!savedAnimatedCaptions;
+  if (savedAppleSync !== null) config.appleSyncStyle = !!savedAppleSync;
+  if (savedSourceBadge !== null) config.showLyricsSource = !!savedSourceBadge;
   if (savedSingerColors !== null) config.useSingerColors = !!savedSingerColors;
   document.body.classList.toggle('ytm-singer-colors-enabled', !!config.useSingerColors);
+  applyAppleSyncClass();
+  setupPointerActivityWatch();
 
   // 1. 歌詞の太さ
   const savedWeight = await storage.get('ytm_lyric_weight');
@@ -6793,6 +8971,11 @@ const runtimeSettingsReady = (async function applySavedRuntimeSettings() {
   }
 
   // 2. 背景の明るさ
+  //
+  // 既定値を引き上げた。以前の 0.4 はアートワークの色がほとんど出ず、
+  // この拡張の見どころを一つ潰していたため。
+  // 自分でスライダーを動かした人は保存値がそのまま使われる。
+  // 一度も触っていない人は、既存ユーザーも含めて新しい既定値になる。
   const savedBright = await storage.get('ytm_bg_brightness');
   if (savedBright) {
     config.bgBrightness = savedBright;
@@ -6827,11 +9010,32 @@ const runtimeSettingsReady = (async function applySavedRuntimeSettings() {
 
 // ===================== 初期化 =====================
 
+// Windows は日本語が Yu Gothic UI 等にフォールバックし、macOS の Hiragino Sans より
+// 同じ font-weight でも太く見える。CSS 側で補正するための目印を付ける。
+try {
+  const platform = (navigator.userAgentData && navigator.userAgentData.platform)
+    || navigator.platform || '';
+  if (/win/i.test(platform)) document.body.classList.add('ytm-win');
+} catch (e) { /* 判定できなければ補正しないだけ */ }
+
+// 背景アニメーションを、見えていない間は止める。
+// 動かし続けると、上に乗っている backdrop-filter の要素が毎フレーム
+// 裏側のぼかしを計算し直すことになり、そのぶん無駄に電力と CPU を使う。
+const updateAmbientAnimationState = () => {
+  const video = document.querySelector('video');
+  const idle = document.hidden || !!(video && video.paused);
+  document.body.classList.toggle('ytm-anim-idle', idle);
+};
+document.addEventListener('visibilitychange', updateAmbientAnimationState);
+document.addEventListener('play', updateAmbientAnimationState, true);
+document.addEventListener('pause', updateAmbientAnimationState, true);
+updateAmbientAnimationState();
+
 ReplayManager.init();
 QueueManager.init();
 CloudSync.init();
 
-console.log('YTM Immersion loaded.');
+YTMLog.log('YTM Immersion loaded.');
 
 
 const setupObserver = () => {
@@ -6896,7 +9100,7 @@ const setupObserver = () => {
     characterData: true
   });
 
-  console.log('YTM Immersion: Zero-delay observer started.');
+  YTMLog.log('YTM Immersion: Zero-delay observer started.');
 
   tick();
 };
