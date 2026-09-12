@@ -207,6 +207,47 @@ test('the PIP window carries the same word-sync rules as the main window', () =>
   }
 })
 
+// PIP の見た目は、この中に書いた1枚の文字列が全部。閉じ括弧をひとつ落とすと
+// そこから下のルールが丸ごと前のルールの中身として捨てられ、操作ボタンが
+// 素の <button>(小さな白い四角)になって左上に転がる。実際にそうなっていた。
+const pipStyleSheet = (() => {
+  const start = pipSource.indexOf('forceStyle.textContent = `')
+  assert.notEqual(start, -1, 'PIP のスタイルの目印が変わっている')
+  const from = start + 'forceStyle.textContent = `'.length
+  const end = pipSource.indexOf('`;', from)
+  assert.notEqual(end, -1, 'PIP のスタイルの終わりが見つからない')
+  return pipSource.slice(from, end)
+})()
+
+// 行ごとの括弧の深さ。0 = ルールの外。
+const cssDepthAt = (css, needle) => {
+  const upto = css.indexOf(needle)
+  assert.notEqual(upto, -1, `PIP stylesheet is missing ${needle}`)
+  const head = css.slice(0, upto)
+  return (head.match(/\{/g) || []).length - (head.match(/\}/g) || []).length
+}
+
+test('the PIP stylesheet closes every rule it opens', () => {
+  const opens = (pipStyleSheet.match(/\{/g) || []).length
+  const closes = (pipStyleSheet.match(/\}/g) || []).length
+  assert.equal(opens, closes, 'PIP のスタイルで括弧が閉じていない')
+})
+
+test('the PIP controls keep their own rules (not swallowed by a broken block)', () => {
+  // ここが 0 でなければ、前のルールが閉じられていないということ。
+  for (const selector of [
+    '#pip-lyrics-container .lyric-line.lyric-past {',
+    '.lyric-translation {',
+    '.controls-box {',
+    '.control-btn {',
+    '.main-btn {',
+    '.sub-btn {',
+    '.top-right-btn {',
+  ]) {
+    assert.equal(cssDepthAt(pipStyleSheet, selector), 0, `${selector} が別のルールの中に入っている`)
+  }
+})
+
 test('PIP rows are measured in their own window after being copied', () => {
   assert.match(lyricsUiSource, /PipManager\.pipLyricsContainer\.querySelectorAll\('\.lyric-line\.ytm-word-sync'\)/)
   assert.match(lyricsUiSource, /if \(!row\._ytmWordSpans && !row\._ytmRehydrated\) rehydrateLyricWordRow\(row\)/)

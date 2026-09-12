@@ -91,8 +91,46 @@ test('デバッグで増えるのはコンソールへの記録だけ', () => {
 
 test('押すと歌詞メニューが開く', () => {
   assert.match(fnSource, /el\.addEventListener\('click', open\)/)
-  assert.match(fnSource, /openLyricsMenu\(\)/)
+  assert.match(fnSource, /toggleLyricsMenu\(\)/)
   assert.match(fnSource, /role', 'button'/, '読み上げから押せることが分からない')
+})
+
+// バッジは「⌄」を出しているのだから、押して開いたものは押して閉じられること。
+// 外側クリックで閉じる係は capture で先に走るので、バッジの分は除外しないと
+// 「閉じる → 即座に開き直す」になって永遠に閉じられない。
+const loadToggle = (visibleAtStart) => {
+  const src = uiSource.slice(
+    uiSource.indexOf('const toggleLyricsMenu'),
+    uiSource.indexOf('function updateLyricsSourceDebugBadge'),
+  )
+  const classes = new Set(visibleAtStart ? ['visible'] : [])
+  let opened = 0
+  const context = {
+    ui: { uploadMenu: { classList: {
+      contains: (n) => classes.has(n),
+      add: (n) => classes.add(n),
+      remove: (n) => classes.delete(n),
+    } } },
+    openLyricsMenu: () => { opened += 1; classes.add('visible') },
+    hideCandidateHoverPreview: () => {},
+  }
+  vm.runInNewContext(`${src}\ntoggleLyricsMenu();`, context)
+  return { visible: classes.has('visible'), opened }
+}
+
+test('もう一度押すと歌詞メニューが閉じる', () => {
+  assert.equal(loadToggle(false).visible, true, '閉じている時に押しても開かない')
+  const second = loadToggle(true)
+  assert.equal(second.visible, false, '開いている時に押しても閉じない')
+  assert.equal(second.opened, 0, '閉じるはずの押下で開き直している')
+})
+
+test('外側クリックで閉じる係はバッジを触らない', () => {
+  const closer = uiSource.slice(
+    uiSource.indexOf('if (!uploadMenuGlobalSetup)'),
+    uiSource.indexOf('function setupDeleteDialog'),
+  )
+  assert.match(closer, /#ytm-lyrics-source-debug/)
 })
 
 test('手を動かした時だけ出す(常設しない)', () => {
@@ -112,6 +150,56 @@ test('マウスが止まったら引っ込む', () => {
     uiSource.indexOf('const setupPointerActivityWatch'),
   )
   assert.doesNotMatch(watch, /querySelector|getBoundingClientRect|storage\./)
+})
+
+const loadPointerWatch = () => {
+  const src = uiSource.slice(
+    uiSource.indexOf('const POINTER_IDLE_HIDE_MS'),
+    uiSource.indexOf('const setupPointerActivityWatch'),
+  )
+  const classes = new Set()
+  let timer = null
+  let armed = 0
+  const context = {
+    document: { body: { classList: {
+      add: (n) => classes.add(n),
+      remove: (n) => classes.delete(n),
+    } } },
+    setTimeout: (fn) => { armed += 1; timer = fn; return armed },
+    clearTimeout: () => { timer = null },
+  }
+  vm.runInNewContext(`${src}\nthis.note = notePointerActivity;`, context)
+  return {
+    move: (x, y) => context.note({ type: 'mousemove', clientX: x, clientY: y }),
+    press: () => context.note({ type: 'mousedown', clientX: 0, clientY: 0 }),
+    idle: () => { const fn = timer; timer = null; if (fn) fn() },
+    visible: () => classes.has('ytm-pointer-active'),
+    armed: () => armed,
+  }
+}
+
+test('手を置いたままなら引っ込む(同じ座標の mousemove は操作ではない)', () => {
+  // Chrome は scrollTop が動くと、カーソルの下の物を取り直すために同じ座標の
+  // mousemove を投げる。歌詞は行が変わるたび毎フレーム scrollTop を書くので、
+  // これを操作と数えるとバッジが曲の間じゅう出たままになる。
+  const w = loadPointerWatch()
+  w.move(10, 10)
+  assert.equal(w.visible(), true)
+  assert.equal(w.armed(), 1)
+  w.move(10, 10)
+  assert.equal(w.armed(), 1, '同じ座標でタイマーを張り直している')
+  w.idle()
+  assert.equal(w.visible(), false, '手を動かしていないのに引っ込まない')
+})
+
+test('本当に動かせば出る', () => {
+  const w = loadPointerWatch()
+  w.move(10, 10)
+  w.move(11, 10)
+  assert.equal(w.armed(), 2)
+  const p = loadPointerWatch()
+  p.press()
+  assert.equal(p.visible(), true, '押した時は座標を見ずに出す')
 })
 
 // ── ズレ直し ────────────────────────────────────────────
