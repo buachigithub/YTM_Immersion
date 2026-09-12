@@ -2182,9 +2182,22 @@ const LYRICS_QUALITY_LABELS = ['', '時刻なし', '行同期', '単語同期', 
 // 手を伸ばす途中で条件が切れて消えてしまう。
 const POINTER_IDLE_HIDE_MS = 2600;
 let pointerIdleTimer = null;
+// 手を置いたままでも届く mousemove がある。Chrome は scrollTop が動くと、
+// カーソルの下にある物が変わったかを取り直すために、同じ座標の mousemove を
+// 投げてくる。歌詞は行が変わるたびに毎フレーム scrollTop を書くので、画面の
+// 上にカーソルを置いたままにしていると、曲が続くかぎりそれが届き続け、
+// 「ずっと手を動かしている」ことになってバッジが引っ込まなかった。
+// 座標が動いた時だけ本物の操作として扱う。
+let lastPointerX = null;
+let lastPointerY = null;
 
-const notePointerActivity = () => {
+const notePointerActivity = (ev) => {
   if (typeof document === 'undefined' || !document.body) return;
+  if (ev && ev.type === 'mousemove') {
+    if (ev.clientX === lastPointerX && ev.clientY === lastPointerY) return;
+    lastPointerX = ev.clientX;
+    lastPointerY = ev.clientY;
+  }
   document.body.classList.add('ytm-pointer-active');
   if (pointerIdleTimer) clearTimeout(pointerIdleTimer);
   pointerIdleTimer = setTimeout(() => {
@@ -2242,6 +2255,20 @@ const openLyricsMenu = () => {
   ui.uploadMenu.classList.add('visible');
 };
 
+// バッジは「⌄」を出している以上、押して開いたものは押して閉じられないと
+// おかしい。開いている時に押しても閉じないのは、外側クリックで閉じる係が
+// 捕捉段階(capture)で先に閉じ、その直後にここが開き直していたため。
+// 閉じる係の方でバッジを除外し、開け閉ては全部ここが持つ。
+const toggleLyricsMenu = () => {
+  if (!ui.uploadMenu) return;
+  if (ui.uploadMenu.classList.contains('visible')) {
+    ui.uploadMenu.classList.remove('visible');
+    hideCandidateHoverPreview();
+    return;
+  }
+  openLyricsMenu();
+};
+
 function updateLyricsSourceDebugBadge(payload) {
   // この関数はテストで updateLyricsSourceState だけ切り出して実行されることがあり、
   // その文脈には YTMLog も document も無い。存在確認してから触る。
@@ -2266,7 +2293,7 @@ function updateLyricsSourceDebugBadge(payload) {
     const open = (ev) => {
       ev.preventDefault();
       ev.stopPropagation();
-      openLyricsMenu();
+      toggleLyricsMenu();
     };
     el.addEventListener('click', open);
     el.addEventListener('keydown', (ev) => {
@@ -5749,6 +5776,9 @@ function setupUploadMenu(uploadBtn) {
       if (!ui.uploadMenu) return;
       if (!ui.uploadMenu.classList.contains('visible')) return;
       if (ui.uploadMenu.contains(ev.target) || uploadBtn.contains(ev.target)) return;
+      // 取得元バッジは自分で開け閉てする。ここで先に閉じると、直後に
+      // バッジ側が開き直して二度と閉じられなくなる。
+      if (ev.target?.closest?.('#ytm-lyrics-source-debug')) return;
       ui.uploadMenu.classList.remove('visible');
     }, true);
   }

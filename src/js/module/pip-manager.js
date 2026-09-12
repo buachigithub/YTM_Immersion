@@ -260,6 +260,8 @@ const forceStyle = pipDoc.createElement('style');
           background-image: none;
           -webkit-text-fill-color: currentColor;
           text-shadow: none !important;
+        }
+
         /* 通常画面と同じく、再生が終わった行は位置を保ったままフェードする。 */
         #pip-lyrics-container .lyric-line.lyric-past {
           opacity: 0 !important;
