@@ -220,6 +220,46 @@ const forceStyle = pipDoc.createElement('style');
         .lyric-line.active .lyric-char.char-pending { opacity: 0.25 !important; }
         .lyric-line.active .lyric-char.char-active { opacity: 1 !important; }
 
+        /* ── Apple Music 風の同期表示（PIP 版）──────────────
+           PIP は別文書で、本体の style.css を読んでいない。
+           意味は src/css/style.css の同名ブロックと同じ:
+             行に --sweep (先頭から進んだ px) と --feather (ぼかし半幅 px)
+             語に --wx (語の開始位置 px) / --wg / --wglowa / --wglowr
+           持ち上がりと膨らみは Web Animations 側(lyrics-ui.js)。
+           両方を直す時は必ず片方だけにならないようにすること。
+           片方だけ直っていないことを tests/lyrics-apple-sync.test.mjs が見ている。 */
+        @property --sweep { syntax: '<number>'; inherits: true; initial-value: 0; }
+        .lyric-line.ytm-word-sync { --feather: 10; --ytm-rest-alpha: 0.26; }
+        .lyric-line.ytm-word-sync.active { --ytm-rest-alpha: 0.4; }
+        .lyric-phrase.lyric-phrase-sync { margin: 0; }
+        .lyric-line.ytm-word-sync .lyric-word {
+          --wx: 0; --feather: 10; --wg: 0; --wglowa: 0; --wglowr: 0;
+          display: inline-block;
+          white-space: pre;
+          /* transform は Web Animations が合成側で動かす(本体と同じ) */
+          transform-origin: 50% 78%;
+          transition: none;
+        }
+        .lyric-line.ytm-word-sync.active .lyric-word {
+          /* background-size / background-position は使わないこと。
+             画像からはみ出した語が透明になって消える(本体側の注釈を参照)。 */
+          background-image: linear-gradient(90deg,
+              currentColor calc((var(--sweep) - var(--wx) - var(--feather)) * 1px),
+              color-mix(in srgb, currentColor calc(var(--ytm-rest-alpha) * 100%), transparent)
+                calc((var(--sweep) - var(--wx) + var(--feather)) * 1px));
+          background-repeat: no-repeat;
+          -webkit-background-clip: text;
+          background-clip: text;
+          -webkit-text-fill-color: transparent;
+          text-shadow: 0 0 calc(var(--wglowr) * 1em)
+            color-mix(in srgb,
+              color-mix(in srgb, currentColor 55%, #fff)
+              calc(var(--wg) * var(--wglowa) * 100%), transparent) !important;
+        }
+        .lyric-line.ytm-word-sync:not(.active) .lyric-word {
+          background-image: none;
+          -webkit-text-fill-color: currentColor;
+          text-shadow: none !important;
         /* 通常画面と同じく、再生が終わった行は位置を保ったままフェードする。 */
         #pip-lyrics-container .lyric-line.lyric-past {
           opacity: 0 !important;
@@ -374,6 +414,10 @@ pipDoc.body.innerHTML = `
 
       this.pipLyricsContainer.addEventListener('scroll', () => {
         if (!this.pipLyricsContainer) return;
+        // 自動スクロールは毎フレーム scrollTop を書くので、その間の
+        // scroll イベントをユーザー操作と取り違えない
+        // (lyrics-ui の stepLyricScroll がこの時刻を伸ばし続ける)。
+        if (performance.now() < (this.pipLyricsContainer._suppressUserScrollUntil || 0)) return;
         if (this.pipLyricsContainer._isProgrammaticScrolling) {
           this.pipLyricsContainer._isProgrammaticScrolling = false;
           return;

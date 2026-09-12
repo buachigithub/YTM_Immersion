@@ -120,23 +120,6 @@ function createPayloadHarness(useAnimatedCaptions = true) {
   return context.helpers
 }
 
-function runFallbackState(payload, config, notify = true) {
-  const updateSource = extractFunctionDeclaration(lyricsUiSource, 'updateLyricsSourceState')
-  const context = { config, payload, notify }
-  vm.runInNewContext(`
-    let currentLyricsSource = null;
-    let isFallbackLyrics = false;
-    let shown = 0;
-    let hidden = 0;
-    function showFallbackNotice() { shown += 1; }
-    function hideFallbackNotice() { hidden += 1; }
-    ${updateSource}
-    updateLyricsSourceState(payload, notify);
-    globalThis.result = { currentLyricsSource, isFallbackLyrics, shown, hidden };
-  `, context, { filename: 'lyrics-ui-fallback-state.js' })
-  return context.result
-}
-
 test('enabled srv3 animation wins over DynamicLRC and line-only display modes', () => {
   const { hasCharacterSyncedLines, selectLyricsPayload } = createPayloadHarness(true)
   const dynamicLines = [{
@@ -217,12 +200,21 @@ test('srv3 can replace preferred YTM lyrics both immediately and after the 400ms
   assert.match(loadSource, /!backgroundHasSrv3/)
 })
 
+// 歌い終わった行は active を外す(歌っていないのに光っていたら嘘)。
+// ただし past にはしない。past は不可視なので、次の行が始まるまで画面から
+// 歌詞が消える。終わり時刻を持つのは文字同期の行だけなので、そのままだと
+// 「同期が細かい曲ほど画面が空になる」という逆転になる。
+// 実測: Dear (Mrs. GREEN APPLE) は行間の空きが歌っている時間の6割あり
+// (歌 166秒 / 空き 101秒)、点いて消えて点いて消えて、に見えていた。
+// 消える時機を「自分が終わった時」から「次が始まった時」へ移してある。
 test('finished DynamicLRC rows become past rows in the main view and PiP', () => {
   const highlightSource = extractFunctionDeclaration(lyricsUiSource, 'updateLyricHighlight')
   assert.match(highlightSource, /primaryHasDynamicRange/)
   assert.match(highlightSource, /primaryIsActive/)
-  assert.match(highlightSource, /primaryDynamicEnded/)
   assert.match(highlightSource, /classList\.toggle\('lyric-past', isPast\)/)
+  // 自分の終わりで消さないこと
+  assert.doesNotMatch(highlightSource, /primaryDynamicEnded/)
+  assert.match(highlightSource, /const isPast = idx >= 0 && !isActive && i < idx;/)
 
   assert.match(pipManagerSource, /#pip-lyrics-container \.lyric-line\.lyric-past/)
   assert.match(pipManagerSource, /ytm-user-browsing-lyrics/)
@@ -362,56 +354,56 @@ test('legacy string cache is provisional while new manual cache remains authorit
   )
   assert.match(
     objectCacheSource,
-    /currentLyricsResultPriority\s*=\s*cached\.manualLyrics\s*\?\s*3\s*:\s*\(cachedLrcLibIsFallback\s*\?\s*1\s*:\s*2\)/,
+    /currentLyricsResultPriority\s*=\s*cachedIsUserChoice\s*\?\s*3\s*:\s*2/,
   )
 })
 
-test('cached LrcLib lyrics are fallback only in standard mode and respect its toggle', () => {
+// 以前は「旧デフォルト standard の時だけ LrcLib を暫定扱いにする」判定が
+// あったが、standard は選択肢から消えており normalizeSourceMode も返さない。
+// 到達しない条件だったので畳んだ。
+//
+// 残る分かれ目は「本人が決めたかどうか」だけ。手動アップロードと、
+// 候補メニューでの取得元の選択がそれにあたる。ここを 2 のままにすると、
+// 次に同じ曲をかけた時に裏で走った取得(同じく 2)へ上書きされ、
+// 選んだ歌詞が一瞬出てから差し替わる。
+test('本人が決めた歌詞はキャッシュから戻しても最優先', () => {
   const objectCacheSource = sourceBetween(
     lyricsUiSource,
     "} else if (typeof cached === 'object') {",
     'syncLyricsLockState();',
   )
-  const policyMatch = objectCacheSource.match(
-    /const cachedSource\s*=[\s\S]*?const cacheSourceAllowed\s*=\s*[^;]+;/,
-  )
-  assert.ok(policyMatch, 'cached LrcLib policy should be present')
-  const priorityMatch = objectCacheSource.match(
-    /currentLyricsResultPriority\s*=\s*cached\.manualLyrics\s*\?\s*3\s*:\s*\(cachedLrcLibIsFallback\s*\?\s*1\s*:\s*2\)\s*;/,
-  )
-  assert.ok(priorityMatch, 'cache priority policy should be present')
+  assert.doesNotMatch(objectCacheSource, /cachedLrcLibIsFallback/,
+    '到達しない暫定判定が戻っている')
+  assert.doesNotMatch(lyricsUiSource, /\|\| 'standard'\) === 'standard'/,
+    "normalizeSourceMode が返さない 'standard' を見ている")
 
-  const evaluate = (cached, config) => {
-    const context = { cached, config }
-    vm.runInNewContext(`
-      ${policyMatch[0]}
-      let currentLyricsResultPriority = 0;
-      ${priorityMatch[0]}
-      globalThis.result = {
-        cachedLrcLibIsFallback,
-        cacheSourceAllowed,
-        priority: currentLyricsResultPriority,
-      };
-    `, context, { filename: 'lyrics-ui-cache-policy.js' })
-    return context.result
-  }
+  assert.match(
+    objectCacheSource,
+    /cachedIsUserChoice = !!\(cached\.manualLyrics \|\| cached\.manualChoice\)/,
+    '候補の選択が本人の決定として扱われていない',
+  )
+  assert.match(
+    objectCacheSource,
+    /currentLyricsResultPriority = cachedIsUserChoice \? 3 : 2;/,
+  )
+  assert.match(
+    objectCacheSource,
+    /selectedCandidateId = String\(cached\.candidateId\)/,
+    '選択中の印がメニューに戻らない',
+  )
+})
 
-  assert.deepEqual(
-    { ...evaluate({ lyricsSource: 'lrclib' }, { lyricSourceMode: 'standard', useLrcLibFallback: true }) },
-    { cachedLrcLibIsFallback: true, cacheSourceAllowed: true, priority: 1 },
+test('候補を選んだら、その事実と候補一覧ごと保存する', () => {
+  const save = sourceBetween(
+    lyricsUiSource,
+    'async function selectCandidateById(candId) {',
+    'await applyLyricsText(nextLyricsText);',
   )
-  assert.deepEqual(
-    { ...evaluate({ lyricsSource: 'lrclib' }, { lyricSourceMode: 'standard', useLrcLibFallback: false }) },
-    { cachedLrcLibIsFallback: true, cacheSourceAllowed: false, priority: 1 },
-  )
-  assert.deepEqual(
-    { ...evaluate({ lyricsSource: 'lrclib' }, { lyricSourceMode: 'lrclib', useLrcLibFallback: false }) },
-    { cachedLrcLibIsFallback: false, cacheSourceAllowed: true, priority: 2 },
-  )
-  assert.equal(
-    evaluate({ lyricsSource: 'manual', manualLyrics: true }, { lyricSourceMode: 'standard', useLrcLibFallback: true }).priority,
-    3,
-  )
+  assert.match(save, /manualChoice: true/, '本人の決定として保存していない')
+  assert.match(save, /candidateId: cand\.id \|\| candId/)
+  assert.match(save, /candidates: Array\.isArray\(lyricsCandidates\)/,
+    '候補一覧を残していない(次に開いた時に選び直せない)')
+  assert.match(save, /lyricsSource: candidateSource/)
 })
 
 test('late LRCHub upgrade rejects stale track, request, and video identities', async () => {
@@ -486,58 +478,6 @@ test('same-title video changes and candidate awaits carry explicit identity guar
   assert.match(candidateSource, /cand\?\.lyricsComplete\s*!==\s*true/)
 })
 
-test('fallback notice appears only for enabled standard-mode LrcLib fallback', () => {
-  const standardConfig = { lyricSourceMode: 'standard', useLrcLibFallback: true }
-  const shown = runFallbackState(
-    { lyricsSource: 'lrclib', fallbackUsed: true },
-    standardConfig,
-  )
-  assert.deepEqual(
-    { ...shown },
-    { currentLyricsSource: 'lrclib', isFallbackLyrics: true, shown: 1, hidden: 0 },
-  )
-
-  const disabled = runFallbackState(
-    { lyricsSource: 'lrclib', fallbackUsed: true },
-    { lyricSourceMode: 'standard', useLrcLibFallback: false },
-  )
-  assert.equal(disabled.shown, 0)
-  assert.equal(disabled.isFallbackLyrics, false)
-
-  const lrcLibOnly = runFallbackState(
-    { lyricsSource: 'lrclib', fallbackUsed: true },
-    { lyricSourceMode: 'lrclib', useLrcLibFallback: true },
-  )
-  assert.equal(lrcLibOnly.shown, 0)
-  assert.equal(lrcLibOnly.isFallbackLyrics, false)
-
-  const upgraded = runFallbackState(
-    { lyricsSource: 'lrchub', fallbackUsed: false },
-    standardConfig,
-    false,
-  )
-  assert.equal(upgraded.shown, 0)
-  assert.equal(upgraded.hidden, 1)
-})
-
-test('fallback notice has dedicated quiet CSS away from the generic toast', () => {
-  const fallbackBlock = sourceBetween(
-    styleSource,
-    '#ytm-fallback-toast {',
-    '#ytm-fallback-toast.visible',
-  )
-  assert.match(fallbackBlock, /position:\s*fixed/)
-  assert.match(fallbackBlock, /bottom:\s*calc\(/)
-  assert.match(fallbackBlock, /right:\s*18px/)
-  assert.match(fallbackBlock, /font-size:\s*11px/)
-  assert.match(fallbackBlock, /pointer-events:\s*none/)
-  assert.match(fallbackBlock, /opacity:\s*0/)
-  assert.doesNotMatch(fallbackBlock, /\btop\s*:/)
-  assert.doesNotMatch(styleSource, /#ytm-toast\s*,\s*#ytm-fallback-toast/)
-  assert.match(styleSource, /#ytm-fallback-toast\.visible\s*\{[\s\S]*?opacity:\s*1/)
-  assert.match(lyricsUiSource, /createEl\('div',\s*'ytm-fallback-toast'/)
-})
-
 test('cold start waits for persisted lyric settings before observation and playback loops', () => {
   const settingsSource = sourceBetween(
     lyricsUiSource,
@@ -557,4 +497,43 @@ test('cold start waits for persisted lyric settings before observation and playb
     contentSource,
     /Promise\.resolve\(runtimeSettingsReady\)\.then\(\(\)\s*=>\s*\{[\s\S]*?setupObserver\(\)[\s\S]*?startLyricRafLoop\(\)/,
   )
+})
+
+// 候補を選んだ10秒後の取り直しは、LRCHub に報告した時だけ走らせる。
+//
+// これは「この候補が正しい」とサーバーへ報告したあと、向こうの反映を
+// 拾い直すための処理。報告先が無い取得元(SimpMusic / LyricsPlus / LrcLib)で
+// 走らせると、拾うものが何も無いのに storage.remove で「選んだ」記録ごと
+// 消し、loadLyrics が最初から取り直す。YTM優先なら当然 YTM に戻る。
+// 実際「SimpMusic に切り替えたのに10秒後 YTM に戻る」不具合が出た。
+test('取得元をまたいだ候補を選んでも、あとから取り直して戻さない', () => {
+  const fn = sourceBetween(
+    lyricsUiSource,
+    'async function selectCandidateById(candId) {',
+    'let lyricsLockState = null;',
+  )
+  assert.match(
+    fn,
+    /const reportsToLrchub = candidateSource === 'lrchub' && !cand\.providerCandidate/,
+  )
+  // 取り直しの手前で打ち切っていること
+  const guardAt = fn.indexOf('if (!reportsToLrchub) return;')
+  const removeAt = fn.indexOf('storage.remove(reloadKey)')
+  const reloadAt = fn.indexOf('loadLyrics(metaNow)')
+  assert.ok(guardAt !== -1, '報告していない時に打ち切る関門が無い')
+  assert.ok(removeAt !== -1 && reloadAt !== -1)
+  assert.ok(guardAt < removeAt && guardAt < reloadAt,
+    'キャッシュ削除と取り直しが関門より前にある')
+})
+
+test('選んだ記録を消す前に、選んだこと自体は保存されている', () => {
+  const fn = sourceBetween(
+    lyricsUiSource,
+    'async function selectCandidateById(candId) {',
+    'let lyricsLockState = null;',
+  )
+  const saveAt = fn.indexOf('manualChoice: true')
+  const guardAt = fn.indexOf('if (!reportsToLrchub) return;')
+  assert.ok(saveAt !== -1 && guardAt !== -1)
+  assert.ok(saveAt < guardAt, '保存より先に打ち切ると選択が残らない')
 })

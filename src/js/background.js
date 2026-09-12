@@ -23,6 +23,103 @@ const YTMLog = (() => {
 })();
 
 
+// フォールバック段で「先着した方」を確定させる前に置く猶予。
+// 表示前に一度だけ待つ値なので、伸ばすとそのまま歌詞の初回表示が遅れる。
+const FALLBACK_GRACE_MS = 600;
+
+// LRCHub の一次問い合わせをどこまで待って「先に出す」判断をするか。
+const EARLY_HUB_WAIT_MS = 1500;
+
+// 待ちを重ねない。上の猶予は「最初の有効な結果が出てから」の総量として
+// 使い、段ごとに足し算しない。以前は 1.5 秒 + 0.6 秒 + 0.8 秒と積み上がり、
+// LrcLib の歌詞が手元にあるのに最大 2.9 秒あとまで出せなかった。
+const POST_FALLBACK_GRACE_MS = 800;
+
+// 文字(語)単位の時刻を実際に持っているか。
+// GET_LYRICS と FIND_ALTERNATE_LYRICS の両方から使うのでモジュール直下に置く。
+const hasCharacterSyncedLines = (value) => (
+  Array.isArray(value) && value.some(line => (
+    Array.isArray(line?.chars) && line.chars.some(char => {
+      const hasText = [char?.c, char?.char, char?.text, char?.caption, char?.value]
+        .some(text => String(text ?? '').length > 0);
+      const hasTime = [char?.t, char?.startTimeMs, char?.start_ms, char?.startMs, char?.time]
+        .some(time => time !== null && time !== undefined &&
+          !(typeof time === 'string' && !time.trim()) && Number.isFinite(Number(time)));
+      return hasText && hasTime;
+    })
+  ))
+);
+
+// ── 別の曲のデータを弾く ──────────────────────────────────
+// 取得元によっては、videoId に紐づいたレコードの中身が別の曲ということが
+// ある。実測: 夢灯籠(S6kjwLlKXnk / 131秒)のレコードに「夏のせい」の歌詞が
+// 入っていた。songTitle も artistName も正しく「夢灯籠 / RADWIMPS」なので、
+// メタデータを突き合わせても気づけない。
+//
+// 手がかりは時刻。歌詞の最後の行が曲の終わりを大きく超えていたら、
+// その歌詞はこの曲のものではない。上の例では歌詞が 317 秒まで続いていた
+// (曲の 2.4 倍)。曲の長さは <video>.duration の実測値なので信用できる。
+//
+// 版違いで数十秒ずれる正しいデータを巻き込まないよう、弾くのは
+// 「明らかに別物」だけに絞る。手元の正しい5曲での超過は最大 62 秒だった。
+const LYRICS_OVERSHOOT_RATIO = 1.25;
+const LYRICS_OVERSHOOT_MARGIN_SEC = 30;
+
+const lastLyricTimeSec = (lyrics) => {
+  const text = String(lyrics ?? '');
+  if (!text) return null;
+  let last = null;
+  // [mm:ss.xx] と [hh:mm:ss.xx] の両方
+  const re = /\[(?:(\d{1,2}):)?(\d{1,3}):(\d{1,2}(?:[.:]\d{1,3})?)\]/g;
+  let m;
+  while ((m = re.exec(text))) {
+    const h = m[1] ? Number(m[1]) : 0;
+    const min = Number(m[2]);
+    const sec = Number(String(m[3]).replace(':', '.'));
+    if (!Number.isFinite(min) || !Number.isFinite(sec)) continue;
+    const t = h * 3600 + min * 60 + sec;
+    if (last === null || t > last) last = t;
+  }
+  return last;
+};
+
+const lyricsBelongToTrack = (lyrics, durationSec) => {
+  const duration = Number(durationSec);
+  // 長さが分からない時は判断しない。弾く方に倒すと歌詞が出なくなる
+  if (!Number.isFinite(duration) || duration <= 0) return true;
+  const last = lastLyricTimeSec(lyrics);
+  if (last === null) return true;   // 時刻なしの歌詞は対象外
+  return last <= duration * LYRICS_OVERSHOOT_RATIO + LYRICS_OVERSHOOT_MARGIN_SEC;
+};
+
+// 取得元をまたいだ候補メニューの表示名
+const PROVIDER_CANDIDATE_LABELS = {
+  lrchub: 'LRC Hub',
+  lrclib: 'LrcLib',
+  simpmusic: 'SimpMusic',
+  lyricsplus: 'LyricsPlus',
+};
+
+// 取得元1つぶんを候補メニューの1項目に均す。
+// 選んだ時に追加取得が要らないよう、歌詞本文まで持たせておく。
+const buildProviderCandidate = (providerId, res) => {
+  const lyrics = typeof res?.lyrics === 'string' ? res.lyrics.trim() : '';
+  if (!lyrics) return null;
+  return {
+    id: `provider_${providerId}`,
+    label: PROVIDER_CANDIDATE_LABELS[providerId] || providerId,
+    providerCandidate: true,
+    lyricsSource: providerId,
+    lyrics,
+    dynamicLines: hasCharacterSyncedLines(res.dynamicLines) ? res.dynamicLines : null,
+    animated_lyrics: res.animated_lyrics || res.timedtext || res.timed_text || null,
+    record_id: providerId === 'lrchub' ? getLrchubRecordId(res) : null,
+    lyricsComplete: true,
+    has_synced: /\[\d+:\d{2}(?:[.:]\d{1,3})?\]/.test(lyrics),
+    offset_ms: Number.isFinite(Number(res.offset_ms)) ? Number(res.offset_ms) : 0,
+  };
+};
+
 const getLrchubRecordId = (value) => {
   if (typeof API.getLrchubRecordId === 'function') return API.getLrchubRecordId(value);
   if (!value || typeof value !== 'object') return null;
@@ -202,6 +299,8 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
       artist,
       youtube_url,
       video_id,
+      album,
+      duration_sec,
       use_lrclib = true,
       offset_ms,
       translate_to,
@@ -233,19 +332,6 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
         video_id: resolvedVideoId || null,
       };
 
-      const hasCharacterSyncedLines = (value) => (
-        Array.isArray(value) && value.some(line => (
-          Array.isArray(line?.chars) && line.chars.some(char => {
-            const hasText = [char?.c, char?.char, char?.text, char?.caption, char?.value]
-              .some(text => String(text ?? '').length > 0);
-            const hasTime = [char?.t, char?.startTimeMs, char?.start_ms, char?.startMs, char?.time]
-              .some(time => time !== null && time !== undefined &&
-                !(typeof time === 'string' && !time.trim()) && Number.isFinite(Number(time)));
-            return hasText && hasTime;
-          })
-        ))
-      );
-
       const getHubLyricsQuality = (hubRes) => {
         const animated = hubRes?.animated_lyrics || hubRes?.timedtext || hubRes?.timed_text;
         // srv3 はアニメーション表示そのもの。DynamicLRC が先着していても
@@ -271,7 +357,9 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
         ...requestIdentity,
       });
 
-      const buildHubLyricsPayload = (hubRes, sourceLabel) => {
+      // providerId は content script 側が「今どこの歌詞か」を見る値。
+      // 既定は 'lrchub'。LRCHub 以外のプロバイダーは自分の ID を渡す。
+      const buildHubLyricsPayload = (hubRes, sourceLabel, providerId = 'lrchub') => {
         const candidates = Array.isArray(hubRes.candidates) ? hubRes.candidates : [];
         const meaningData = hubRes.meaningData || API.normalizeLrchubMeaningPayload(hubRes);
         return {
@@ -297,7 +385,7 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
             // translations to the selected video's timeline.
             ...API.normalizeLrchubTranslations(hubRes.lrcMap)
           },
-          lyricsSource: 'lrchub',
+          lyricsSource: providerId,
           sourceLabel,
           fallbackUsed: false,
           lyricsQuality: getHubLyricsQuality(hubRes),
@@ -321,11 +409,46 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
         }
       };
 
-      const asHubResult = (source, res) => (
-        res && typeof res.lyrics === 'string' && res.lyrics.trim()
-          ? { source, res }
-          : null
-      );
+      // ── 取得元をまたいだ候補 ────────────────────────────
+      // 自動選択が1つを選んだあとも、他の取得元が返した歌詞は捨てずに
+      // 候補メニューへ流しておく。上流のデータが壊れている・別テイクの
+      // タイムラインが入っている、といった自動判定では気付けない外れを、
+      // その場で1クリックで乗り換えられるようにするため。
+      //
+      // 表示中の歌詞には触れない専用の経路(LYRICS_META_UPDATE)で送る。
+      // 出したものが後から勝手に入れ替わる方が体験としては悪い。
+      const offeredProviderCandidates = new Set();
+      const offerProviderCandidate = (providerId, res) => {
+        if (!tabId || !res || offeredProviderCandidates.has(providerId)) return;
+        const candidate = buildProviderCandidate(providerId, res);
+        if (!candidate) return;
+        offeredProviderCandidates.add(providerId);
+        try {
+          chrome.tabs.sendMessage(tabId, {
+            type: 'LYRICS_META_UPDATE',
+            payload: {
+              video_id: resolvedVideoId || null,
+              mergeCandidates: [candidate],
+            },
+          });
+        } catch (e) {
+          YTMLog.debug('[BG] Provider candidate offer skipped:', e);
+        }
+      };
+
+      const asHubResult = (source, res, providerId = 'lrchub') => {
+        if (!(res && typeof res.lyrics === 'string' && res.lyrics.trim())) return null;
+        // 中身が別の曲のレコードはここで落とす。候補メニューにも出さない
+        // (この関門を通った結果にだけ offerProviderCandidate が掛かる)。
+        if (!lyricsBelongToTrack(res.lyrics, duration_sec)) {
+          YTMLog.log(
+            `[BG] ${source} の歌詞は別の曲とみなして不採用 ` +
+            `(歌詞は ${Math.round(lastLyricTimeSec(res.lyrics))}秒まで / 曲は ${duration_sec}秒)`
+          );
+          return null;
+        }
+        return { source, res, providerId };
+      };
 
       const firstValidResult = (tasks) => new Promise(resolve => {
         const pendingTasks = tasks.filter(Boolean);
@@ -357,45 +480,31 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
         });
       });
 
-      if (lyric_source_mode === 'lrclib') {
-        try {
-          const lrcLibRes = await API.withTimeout(
-            API.fetchFromLrcLib(track, artist),
-            8000,
-            'lrclib only'
-          );
-          if (lrcLibRes && lrcLibRes.lyrics && lrcLibRes.lyrics.trim()) {
-            YTMLog.log('[BG] Won: LrcLib (LrcLib Only Mode)');
-            sendOnce(buildLrcLibPayload(lrcLibRes, false));
-            return;
-          }
-        } catch (e) {
-          console.warn('[BG] LrcLib fetch failed in LrcLib Only Mode:', e);
-        }
-        sendOnce({
-          success: false,
-          lyrics: '',
-          ...requestIdentity,
-        });
-        return;
-      }
-
       let deliveredHubQuality = 0;
+      let deliveredProviderId = null;
       const resolvedHubResults = [];
 
-      const sendHubLyrics = (hubRes, sourceLabel) => {
+      const sendHubLyrics = (hubRes, sourceLabel, providerId = 'lrchub') => {
         YTMLog.log(`[BG] Won: ${sourceLabel}`);
         deliveredHubQuality = Math.max(deliveredHubQuality, getHubLyricsQuality(hubRes));
-        sendOnce(buildHubLyricsPayload(hubRes, sourceLabel));
+        deliveredProviderId = providerId;
+        sendOnce(buildHubLyricsPayload(hubRes, sourceLabel, providerId));
       };
 
       const pushHubUpgrade = async (hubResult) => {
         if (!responded || !hubResult?.res) return false;
+        const providerId = hubResult.providerId || 'lrchub';
+        // LRCHub の歌詞には翻訳・解説・候補が同じタイムラインで乗っている。
+        // 外部プロバイダーが単語同期という一点だけで上書きすると、
+        // 表示済みの翻訳ごと消えてしまうので差し替えない。
+        // (逆向き、LRCHub が外部を上書きするのは品質が上がるので許す)
+        if (providerId !== 'lrchub' && deliveredProviderId === 'lrchub') return false;
         const quality = getHubLyricsQuality(hubResult.res);
         if (quality <= deliveredHubQuality) return false;
         deliveredHubQuality = quality;
+        deliveredProviderId = providerId;
         YTMLog.log(`[BG] Upgrading lyrics quality to ${hubResult.source} (${quality})`);
-        return pushLyricsUpdate(buildHubLyricsPayload(hubResult.res, hubResult.source));
+        return pushLyricsUpdate(buildHubLyricsPayload(hubResult.res, hubResult.source, providerId));
       };
 
       const pushBestResolvedHubUpgrade = () => {
@@ -405,12 +514,13 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
         if (best) void pushHubUpgrade(best);
       };
 
-      const makeRawHubTask = (source, promise, warningLabel) => (
+      const makeRawHubTask = (source, promise, warningLabel, providerId = 'lrchub') => (
         Promise.resolve(promise)
-          .then(res => asHubResult(source, res))
+          .then(res => asHubResult(source, res, providerId))
           .then(result => {
             if (result) {
               resolvedHubResults.push(result);
+              offerProviderCandidate(providerId, result.res);
               if (responded) void pushHubUpgrade(result);
             }
             return result;
@@ -443,13 +553,66 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
           return null;
         });
 
+      // LrcLib は LRCHub と同時に走らせる。
+      //
+      // 以前はこの下の「LRCHub を待つ 1.5 秒」が明けてから作っていたので、
+      // LRCHub が遅い回はその 1.5 秒ぶん、まるごと何も始まっていなかった。
+      // 行同期止まりの歌詞しか無い曲ほどこの待ちが体感に直結する。
+      // LrcLib は公開 API で、無料枠の共用サーバー(SimpMusic / LyricsPlus)を
+      // 気遣う理由もないため、常時並走させてよい。
+      let lrcLibSettled = null;
+      const lrcLibTask = use_lrclib
+        ? API.withTimeout(API.fetchFromLrcLib(track, artist, duration_sec), 8000, 'lrclib')
+          // 他の取得元と同じ関門を通す(別の曲のデータをここでも弾く)
+          .then(res => asHubResult('LrcLib', res, 'lrclib'))
+          .then(result => {
+            if (result) {
+              lrcLibSettled = result;
+              offerProviderCandidate('lrclib', result.res);
+            }
+            return result;
+          })
+          .catch(e => {
+            console.warn('[BG] LrcLib fetch failed:', e);
+            return null;
+          })
+        : Promise.resolve(null);
+
+      // SimpMusic も LRCHub と同時に走らせる。
+      //
+      // 以前は下の「LRCHub を待つ 1.5 秒」が明けてから作っていた。実測では
+      // LRCHub の応答は 212ms 〜 4933ms とばらつきが大きく、4曲中2曲で
+      // 1.5 秒を超えた。その回、SimpMusic は 336〜683ms で答えられたのに
+      // 1.5 秒待たされていた。
+      //
+      // videoId ひとつの単純な GET で、しかもキャッシュがあるので1曲につき
+      // 生涯1回しか叩かない。文字同期の主力でもあるので常時並走させる。
+      // LyricsPlus はこの下のまま据え置く。track/artist/album/duration の
+      // 検索をミラー横断で投げる重い経路で、実測でも3ミラーとも歌詞を
+      // 返さない(502 / 429 / 402)。毎曲叩いても得るものが無い。
+      let simpMusicSettled = null;
+      const simpMusicRawTask = (typeof API.fetchFromSimpMusic === 'function' && resolvedVideoId)
+        ? makeRawHubTask(
+          'SimpMusic',
+          API.fetchFromSimpMusic({ video_id: resolvedVideoId }),
+          'SimpMusic',
+          'simpmusic',
+        ).then(result => {
+          if (result) simpMusicSettled = result;
+          return result;
+        })
+        : null;
+      const simpMusicSelectionTask = simpMusicRawTask
+        ? API.withTimeout(simpMusicRawTask, 6000, 'simpmusic').catch(() => null)
+        : null;
+
       const earlyMarker = {};
       const earlyPrimary = await Promise.race([
         primarySelectionTask,
-        API.delay(1500).then(() => earlyMarker),
+        API.delay(EARLY_HUB_WAIT_MS).then(() => earlyMarker),
       ]);
       if (earlyPrimary && earlyPrimary !== earlyMarker) {
-        sendHubLyrics(earlyPrimary.res, earlyPrimary.source);
+        sendHubLyrics(earlyPrimary.res, earlyPrimary.source, earlyPrimary.providerId);
         pushBestResolvedHubUpgrade();
         // DynamicLRC (4) が先着していても、最上位の srv3 (5) を検索する。
         if (getHubLyricsQuality(earlyPrimary.res) < 5) {
@@ -461,6 +624,32 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
           await API.withTimeout(earlySearchTask, 5000, 'lrchub search upgrade').catch(() => null);
         }
         return;
+      }
+
+      // 先出しするのは LRCHub が「遅かった」回だけ。
+      // 「持っていない」と即答した回まで先出しすると、そのあと来る
+      // 単語同期(SimpMusic / LyricsPlus)に勝たせる機会を奪ってしまう。
+      // その判定は下のフォールバック段に任せる。
+      //
+      // 遅かった回にかぎっては、もう手元にある歌詞を出してしまう。
+      // 白紙のまま数秒待たせるよりは早く出す方がいい。
+      // あとから LRCHub が届けば、品質を見て差し替わる。
+      //
+      // 出す順は「文字同期を持っている SimpMusic」→「LrcLib」。
+      // SimpMusic を同時に走らせるようにしたので、遅い回ではたいてい
+      // 先に届いている。ここで行同期の LrcLib を挟むと、すぐ下の
+      // フォールバック段が SimpMusic を選び直して一瞬ちらつく。
+      // 文字同期を要求するのは下の段と同じ基準。上流の取り込みが崩れた
+      // レコードに「速かった」というだけで勝たせないため。
+      if (earlyPrimary === earlyMarker) {
+        if (simpMusicSettled && hasCharacterSyncedLines(simpMusicSettled.res?.dynamicLines)) {
+          YTMLog.log('[BG] Won temporarily: SimpMusic (LRCHub slow)');
+          sendHubLyrics(simpMusicSettled.res, simpMusicSettled.source, simpMusicSettled.providerId);
+        } else if (lrcLibSettled) {
+          YTMLog.log('[BG] Won temporarily: LrcLib (LRCHub slow)');
+          sendOnce(buildLrcLibPayload(lrcLibSettled.res, true));
+          deliveredProviderId = 'lrclib';
+        }
       }
 
       const searchRawTask = makeRawHubTask(
@@ -494,47 +683,104 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
         searchRawTask,
         retryRawTask,
       ]);
-      const lrcLibTask = use_lrclib
-        ? API.withTimeout(API.fetchFromLrcLib(track, artist), 8000, 'lrclib')
-          .then(res => (
-            res && typeof res.lyrics === 'string' && res.lyrics.trim()
-              ? { source: 'LrcLib', res }
-              : null
-          ))
-          .catch(e => {
-            console.warn('[BG] LrcLib fetch failed:', e);
-            return null;
-          })
-        : Promise.resolve(null);
+      // ── 追加プロバイダー ──────────────────────────────────
+      // LRCHub がここまでで歌詞を返せなかった曲だけが対象。
+      // どちらも単語(音節)同期を返せるので LrcLib より前に置くが、
+      // 勝ち抜けは早い者勝ちなので実際には3つの競走になる。
+      // 立ち上げをここまで遅らせているのは、LRCHub が答えられる大半の曲で
+      // 無料の共用サーバーを無駄に叩かないため。
+      const lyricsPlusRawTask = (typeof API.fetchFromLyricsPlus === 'function')
+        ? makeRawHubTask(
+          'LyricsPlus',
+          API.fetchFromLyricsPlus({ track, artist, album, duration: duration_sec }),
+          'LyricsPlus',
+          'lyricsplus',
+        )
+        : null;
+      const lyricsPlusSelectionTask = lyricsPlusRawTask
+        ? API.withTimeout(lyricsPlusRawTask, 8000, 'lyricsplus').catch(() => null)
+        : null;
 
-      const winner = await firstValidResult([hubSelectionTask, lrcLibTask]);
-      if (winner && winner.source !== 'LrcLib') {
-        sendHubLyrics(winner.res, winner.source);
+      // フォールバック段の中では、単語同期を返せる2つを LrcLib より優先したい。
+      // ただ firstValidResult は純粋な早い者勝ちなので、ほぼ同時に返ると
+      // 行同期止まりの LrcLib が勝ってしまう。LrcLib が先着した時だけ、
+      // 短い猶予を置いて2つを待つ(LRCHub 対 LrcLib と同じ考え方)。
+      const richFallbackTask = firstValidResult([
+        simpMusicSelectionTask,
+        lyricsPlusSelectionTask,
+      ]);
+      const fallbackSelectionTask = (async () => {
+        const first = await firstValidResult([richFallbackTask, lrcLibTask]);
+        if (!first) return first;
+
+        if (first.providerId !== 'lrclib') {
+          // 上の2つを LrcLib より前に置いている理由は「単語同期を返せるから」
+          // の一点なので、行同期しか持って来なかった回はその理由が消える。
+          // 実際、上流の取り込みが崩れて全行が1文字ずつ欠けたまま配信されて
+          // いる曲があり、それでも「速かった」というだけで勝っていた。
+          // 同じ品質どうしなら、より枯れている LrcLib に譲る。
+          // 待つのは表示前の一度きり。画面に出たあとで差し替えはしない。
+          if (hasCharacterSyncedLines(first.res?.dynamicLines)) return first;
+          const lrcLibMarker = {};
+          const lrcLib = await Promise.race([
+            lrcLibTask,
+            API.delay(FALLBACK_GRACE_MS).then(() => lrcLibMarker),
+          ]);
+          return (lrcLib && lrcLib !== lrcLibMarker) ? lrcLib : first;
+        }
+
+        const richMarker = {};
+        const rich = await Promise.race([
+          richFallbackTask,
+          API.delay(FALLBACK_GRACE_MS).then(() => richMarker),
+        ]);
+        // ここでも条件は同じ。単語同期を持って来た時だけ LrcLib を追い越せる。
+        if (rich && rich !== richMarker && hasCharacterSyncedLines(rich.res?.dynamicLines)) {
+          return rich;
+        }
+        return first;
+      })();
+
+      const winner = await firstValidResult([hubSelectionTask, fallbackSelectionTask]);
+      if (winner && winner.providerId === 'lrchub') {
+        sendHubLyrics(winner.res, winner.source, winner.providerId);
         pushBestResolvedHubUpgrade();
         await Promise.allSettled([primarySelectionTask, searchSelectionTask, retrySelectionTask]);
         return;
       }
 
-      if (winner && winner.source === 'LrcLib') {
-        const graceMarker = {};
-        const graceHub = await Promise.race([
-          hubSelectionTask,
-          API.delay(800).then(() => graceMarker),
-        ]);
-        if (graceHub && graceHub !== graceMarker) {
-          sendHubLyrics(graceHub.res, graceHub.source);
-          pushBestResolvedHubUpgrade();
-          await Promise.allSettled([primarySelectionTask, searchSelectionTask, retrySelectionTask]);
-          return;
-        }
+      if (winner) {
+        // すでに LrcLib を先に出してある回は、ここで待つ意味が無い。
+        // 表示は済んでいるので、あとは pushHubUpgrade が差し替える。
+        // ここで待つと「出ているのに待たされる」時間が積み上がるだけ。
+        if (!responded) {
+          const graceMarker = {};
+          const graceHub = await Promise.race([
+            hubSelectionTask,
+            API.delay(POST_FALLBACK_GRACE_MS).then(() => graceMarker),
+          ]);
+          if (graceHub && graceHub !== graceMarker) {
+            sendHubLyrics(graceHub.res, graceHub.source, graceHub.providerId);
+            pushBestResolvedHubUpgrade();
+            await Promise.allSettled([primarySelectionTask, searchSelectionTask, retrySelectionTask]);
+            return;
+          }
 
-        YTMLog.log('[BG] Won temporarily: LrcLib');
-        sendOnce(buildLrcLibPayload(winner.res, true));
+          YTMLog.log(`[BG] Won temporarily: ${winner.source}`);
+          if (winner.providerId === 'lrclib') {
+            // LrcLib は行同期止まりなので、あとから LRCHub が届いたら譲る前提の
+            // 「暫定表示」として扱う(fallbackUsed = true)。
+            sendOnce(buildLrcLibPayload(winner.res, true));
+            deliveredProviderId = 'lrclib';
+          } else {
+            sendHubLyrics(winner.res, winner.source, winner.providerId);
+          }
+        }
         pushBestResolvedHubUpgrade();
 
         const lateHub = await rawHubTask;
         if (lateHub) {
-          YTMLog.log(`[BG] Upgrading LrcLib lyrics to ${lateHub.source}`);
+          YTMLog.log(`[BG] Upgrading ${winner.source} lyrics to ${lateHub.source}`);
           await pushHubUpgrade(lateHub);
         }
         return;
@@ -547,7 +793,11 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
         ...requestIdentity,
       });
 
-      const lateHub = await rawHubTask;
+      const lateHub = await firstValidResult([
+        rawHubTask,
+        simpMusicRawTask,
+        lyricsPlusRawTask,
+      ]);
       if (lateHub) {
         await pushHubUpgrade(lateHub);
       }
@@ -563,6 +813,86 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
         video_id: resolvedVideoId || null,
       });
     });
+    return true;
+  }
+
+  // 取得元をまたいだ候補のオンデマンド取得。
+  //
+  // GET_LYRICS は LRCHub が答えた時点で他へ問い合わせずに切り上げる
+  // (答えられる大半の曲で無料の共用サーバーを無駄に叩かないため)。
+  // その代わり、表示中の歌詞が曲に合っていない時に乗り換え先が
+  // 1件も無い状態になる。ユーザーがメニューから明示的に頼んだ時だけ、
+  // まだ聞いていない取得元を叩きにいく。自動では走らせない。
+  if (req.type === 'FIND_ALTERNATE_LYRICS') {
+    const {
+      track,
+      artist,
+      album,
+      duration_sec,
+      youtube_url,
+      video_id,
+      exclude,
+    } = req.payload || {};
+    const alternateVideoId = video_id || API.extractVideoIdFromUrl(youtube_url) || '';
+    const skip = new Set(
+      (Array.isArray(exclude) ? exclude : [])
+        .map(value => String(value || '').trim().toLowerCase())
+        .filter(Boolean)
+    );
+
+    (async () => {
+      const tasks = [];
+      const collect = (providerId, makePromise, label) => {
+        if (skip.has(providerId)) return;
+        tasks.push(
+          Promise.resolve()
+            .then(makePromise)
+            .then(res => buildProviderCandidate(providerId, res))
+            .catch(e => {
+              console.warn(`[BG] ${label} alternate fetch failed:`, e);
+              return null;
+            })
+        );
+      };
+
+      collect('lrchub', () => API.withTimeout(
+        API.fetchFromLrchub({
+          track,
+          artist,
+          youtube_url,
+          video_id: alternateVideoId,
+          method: 'POST',
+        }),
+        8000,
+        'lrchub alternate'
+      ), 'LRCHub');
+
+      if (alternateVideoId && typeof API.fetchFromSimpMusic === 'function') {
+        collect('simpmusic', () => API.withTimeout(
+          API.fetchFromSimpMusic({ video_id: alternateVideoId }),
+          8000,
+          'simpmusic alternate'
+        ), 'SimpMusic');
+      }
+
+      if (typeof API.fetchFromLyricsPlus === 'function') {
+        collect('lyricsplus', () => API.withTimeout(
+          API.fetchFromLyricsPlus({ track, artist, album, duration: duration_sec }),
+          10000,
+          'lyricsplus alternate'
+        ), 'LyricsPlus');
+      }
+
+      collect('lrclib', () => API.withTimeout(
+        API.fetchFromLrcLib(track, artist, duration_sec),
+        8000,
+        'lrclib alternate'
+      ), 'LrcLib');
+
+      const candidates = (await Promise.all(tasks)).filter(Boolean);
+      YTMLog.log('[BG] FIND_ALTERNATE_LYRICS ->', candidates.map(c => c.lyricsSource));
+      sendResponse({ success: true, candidates });
+    })();
     return true;
   }
 

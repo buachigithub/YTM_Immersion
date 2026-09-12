@@ -55,44 +55,106 @@ const noteLrchubTransport = (ok) => {
   }
 };
 
-export const pickBestLrcLibHit = (items, artist) => {
+export const normalizeTrackTitle = (s) => String(s || '')
+  .normalize('NFKC')
+  .toLowerCase()
+  .replace(/\s+/g, '')
+  .trim();
+
+const lrcLibDurationSec = (item) => {
+  const n = Number(item?.duration ?? item?.durationSec ?? item?.duration_sec);
+  return Number.isFinite(n) && n > 0 ? n : null;
+};
+
+// 同じ絞り込み段の中から1件選ぶ。曲名と尺で点を付けるだけで、
+// ここで候補を捨てはしない。決め手が無ければ元の「最初の1件」に落ちる。
+//
+// アーティスト名しか見ずに先頭を取っていた頃は、同じ曲の別テイク
+// (「曲名」と「曲名 - From THE FIRST TAKE」など)が並んでいると、
+// 再生中の動画と無関係な方を掴んで最初から最後までずれ続けていた。
+const rankLrcLibTier = (items, track, durationSec) => {
+  if (!items.length) return null;
+  const targetTitle = normalizeTrackTitle(track);
+  const targetDuration = Number.isFinite(Number(durationSec)) && Number(durationSec) > 0
+    ? Number(durationSec)
+    : null;
+  // 手掛かりが何も無ければ従来どおり先頭
+  if (!targetTitle && targetDuration === null) return items[0];
+
+  let best = null;
+  let bestScore = -Infinity;
+  for (const item of items) {
+    let score = 0;
+
+    const title = normalizeTrackTitle(item?.trackName || item?.track_name || item?.name);
+    if (targetTitle && title) {
+      if (title === targetTitle) score += 100;
+      // 部分一致は向きで重みを変える。再生中が「曲名 - 別テイク」の時に
+      // 素の「曲名」で妥協するのは有りだが、その逆は避けたい。
+      else if (targetTitle.includes(title)) score += 40;
+      else if (title.includes(targetTitle)) score += 10;
+    }
+
+    if (targetDuration !== null) {
+      const duration = lrcLibDurationSec(item);
+      if (duration !== null) {
+        const diff = Math.abs(duration - targetDuration);
+        if (diff <= 2) score += 30;
+        else if (diff <= 5) score += 15;
+        else if (diff <= 10) score += 5;
+        // 尺が大きく違うものは別音源。ただし曲名の完全一致は覆さない。
+        else score -= Math.min(30, diff);
+      }
+    }
+
+    // 同点なら先に出てきた方を残す = 従来の「最初の1件」と同じ結果
+    if (score > bestScore) {
+      bestScore = score;
+      best = item;
+    }
+  }
+
+  return best || items[0];
+};
+
+export const pickBestLrcLibHit = (items, artist, options = {}) => {
   if (!Array.isArray(items) || !items.length) return null;
   const target = normalizeArtist(artist);
+  const { track = '', durationSec = null } = options || {};
   const getArtistName = (it) =>
     it.artistName || it.artist || it.artist_name || '';
 
-  let hit = null;
+  if (!target) return null;
 
-  if (target) {
-    hit = items.find(it => {
-      const a = normalizeArtist(getArtistName(it));
-      return a && a === target && (it.syncedLyrics || it.synced_lyrics);
-    });
-    if (hit) return hit;
+  const exactArtist = (it) => {
+    const a = normalizeArtist(getArtistName(it));
+    return !!a && a === target;
+  };
+  const partialArtist = (it) => {
+    const a = normalizeArtist(getArtistName(it));
+    return !!a && (a.includes(target) || target.includes(a));
+  };
+  const hasSynced = (it) => !!(it.syncedLyrics || it.synced_lyrics);
+  const hasPlain = (it) => !!(it.plainLyrics || it.plain_lyrics);
 
-    hit = items.find(it => {
-      const a = normalizeArtist(getArtistName(it));
-      return a && a === target && (it.plainLyrics || it.plain_lyrics);
-    });
-    if (hit) return hit;
+  // 段の順番は従来のまま。変えたのは「段の中でどれを取るか」だけなので、
+  // 今まで歌詞が出ていた曲でここが空振りになることはない。
+  const tiers = [
+    (it) => exactArtist(it) && hasSynced(it),
+    (it) => exactArtist(it) && hasPlain(it),
+    (it) => partialArtist(it) && hasSynced(it),
+    (it) => partialArtist(it) && hasPlain(it),
+  ];
 
-    hit = items.find(it => {
-      const a = normalizeArtist(getArtistName(it));
-      return a && (a.includes(target) || target.includes(a)) && (it.syncedLyrics || it.synced_lyrics);
-    });
-    if (hit) return hit;
-
-    hit = items.find(it => {
-      const a = normalizeArtist(getArtistName(it));
-      return a && (a.includes(target) || target.includes(a)) && (it.plainLyrics || it.plain_lyrics);
-    });
-    if (hit) return hit;
+  for (const matches of tiers) {
+    const tier = items.filter(matches);
+    if (tier.length) return rankLrcLibTier(tier, track, durationSec);
   }
 
   return null;
 };
 
-export const fetchFromLrcLib = (track, artist) => {
+export const fetchFromLrcLib = (track, artist, durationSec = null) => {
   if (!track) return Promise.resolve({ lyrics: '', candidates: [] });
 
   // 曲名だけで引くと結果が最大20件で打ち切られ、同名異曲に押し出されて
@@ -115,8 +177,8 @@ export const fetchFromLrcLib = (track, artist) => {
       YTMLog.log('[BG] LrcLib search result count:', Array.isArray(list) ? list.length : 'N/A');
       const items = Array.isArray(list) ? list : [];
       
-      const hit = pickBestLrcLibHit(items, artist);
-      
+      const hit = pickBestLrcLibHit(items, artist, { track, durationSec });
+
       let bestLyrics = '';
       if (hit) {
         const synced = hit.syncedLyrics || hit.synced_lyrics || '';
@@ -133,7 +195,8 @@ export const fetchFromLrcLib = (track, artist) => {
         return {
           id: `lrclib_${item.id}`,
           artist: item.artistName || item.artist,
-          title: item.trackName || item.trackName,
+          title: item.trackName || item.track_name || item.name || '',
+          duration: lrcLibDurationSec(item),
           source: 'LrcLib',
           has_synced: !!synced,
           lyrics: txt
@@ -1083,6 +1146,28 @@ export const parseLrcTimeToMs = (ts) => {
   return (mm * 60 + ss) * 1000 + ms;
 };
 
+// その行の文字が実際どれくらいの間隔で進んでいるかを見て、
+// 1文字ぶんの妥当な長さを出す。行末の文字を「次の行まで」で
+// 引き伸ばさないための上限に使う。
+const CHAR_DURATION_FALLBACK_MS = 300;
+const CHAR_DURATION_MIN_MS = 120;
+const CHAR_DURATION_MAX_MS = 900;
+
+export const estimateCharDurationMs = (chars) => {
+  if (!Array.isArray(chars) || chars.length < 2) return CHAR_DURATION_FALLBACK_MS;
+  const gaps = [];
+  for (let i = 1; i < chars.length; i++) {
+    const prev = chars[i - 1]?.t;
+    const cur = chars[i]?.t;
+    if (typeof prev === 'number' && typeof cur === 'number' && cur > prev) gaps.push(cur - prev);
+  }
+  if (!gaps.length) return CHAR_DURATION_FALLBACK_MS;
+  gaps.sort((a, b) => a - b);
+  const median = gaps[Math.floor(gaps.length / 2)];
+  // 中央値なので、行の中に伸ばした音が1つあっても引きずられない。
+  return Math.min(CHAR_DURATION_MAX_MS, Math.max(CHAR_DURATION_MIN_MS, median));
+};
+
 export const parseDynamicLrc = (text) => {
   const out = [];
   if (!text) return out;
@@ -1139,10 +1224,18 @@ export const parseDynamicLrc = (text) => {
     }
 
     if (prevMs != null) {
+      const tail = rest.slice(prevEnd);
       let endMs = nextLineMs;
       if (typeof endMs !== 'number') endMs = prevMs + 1500;
       if (endMs <= prevMs) endMs = prevMs + 200;
-      pushDistributed(chars, rest.slice(prevEnd), prevMs, endMs);
+      // 行末の文字を「次の行が始まるまで」で割ると、間奏に入る行で
+      // 破綻する。最後の1〜2文字が数秒後の時刻を持ってしまい、歌い終わって
+      // だいぶ経ってから点灯する。次の行までの空きは無音であって、
+      // そのぶん歌が伸びているわけではない。
+      // その行自身の文字の進み方から妥当な上限を作り、短い方を採る。
+      const tailCount = Math.max(1, Array.from(tail).length);
+      endMs = Math.min(endMs, prevMs + estimateCharDurationMs(chars) * tailCount);
+      pushDistributed(chars, tail, prevMs, endMs);
     }
 
     out.push({
@@ -1231,3 +1324,245 @@ export async function fetchCommunityRemaining() {
   }
   throw lastErr || new Error('community remaining failed');
 }
+
+// ============================================================
+// 追加の歌詞プロバイダー (SimpMusic / LyricsPlus)
+//
+// LRCHub / LrcLib だけだと、次の穴が残る:
+//   - LRCHub に登録が無い曲(特に新譜・海外曲)は行同期すら出ない
+//   - LrcLib は行同期止まりで、単語カラオケにならない
+// この2つはどちらも無料・キー不要で、単語(音節)単位の同期を返す。
+//
+// ■ SimpMusic (https://api-lyrics.simpmusic.org)
+//   YouTube の videoId をそのまま引ける。曲名検索と違って別バージョンを
+//   掴む事故が無いので、当たった時の信頼度が最も高い。
+//   richSyncLyrics は拡張LRC(<mm:ss.xx>語)なので parseDynamicLrc がそのまま使える。
+//
+// ■ LyricsPlus (ibratabian17/lyricsplus)
+//   Apple Music / QQ Music / Musixmatch などを束ねたサーバー。
+//   音節単位の JSON を返す。ホスティングが無料枠なので落ちていることが多く、
+//   ミラーを同時に叩いて最初に返したものを採用する。
+//
+// ■ BetterLyrics について
+//   同種のサービスだが、現在は API 全体が Bearer トークン必須になっており、
+//   トークンは Cloudflare Turnstile を通さないと発行されない。
+//   ボット判定の回避になるためここでは組み込まない。
+// ============================================================
+
+const decodeHtmlEntities = (value) => String(value ?? '')
+  .replace(/&#x([0-9a-fA-F]+);/g, (_, hex) => {
+    const code = parseInt(hex, 16);
+    return Number.isFinite(code) ? String.fromCodePoint(code) : _;
+  })
+  .replace(/&#(\d+);/g, (_, dec) => {
+    const code = parseInt(dec, 10);
+    return Number.isFinite(code) ? String.fromCodePoint(code) : _;
+  })
+  .replace(/&quot;/g, '"')
+  .replace(/&apos;/g, "'")
+  .replace(/&lt;/g, '<')
+  .replace(/&gt;/g, '>')
+  // &amp; は最後。先に戻すと "&amp;lt;" が "<" まで解けてしまう。
+  .replace(/&amp;/g, '&');
+
+const toFiniteMs = (value) => {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+};
+
+// ── SimpMusic ────────────────────────────────────────────────
+export const SIMPMUSIC_ENDPOINT = 'https://api-lyrics.simpmusic.org/v1';
+
+export const pickBestSimpMusicEntry = (items) => {
+  if (!Array.isArray(items) || !items.length) return null;
+  const rank = (item) => {
+    if (!item || typeof item !== 'object') return -1;
+    let score = 0;
+    if (typeof item.richSyncLyrics === 'string' && item.richSyncLyrics.trim()) score += 100;
+    else if (typeof item.syncedLyrics === 'string' && item.syncedLyrics.trim()) score += 50;
+    else if (typeof item.plainLyric === 'string' && item.plainLyric.trim()) score += 10;
+    else return -1;
+    // 投票は僅差の決選投票としてだけ使う。同期の質を逆転させない。
+    const vote = Number(item.vote);
+    if (Number.isFinite(vote)) score += Math.max(-9, Math.min(9, vote));
+    return score;
+  };
+  let best = null;
+  let bestScore = -1;
+  for (const item of items) {
+    const score = rank(item);
+    if (score > bestScore) {
+      best = item;
+      bestScore = score;
+    }
+  }
+  return bestScore >= 0 ? best : null;
+};
+
+export const convertSimpMusicEntry = (entry) => {
+  if (!entry || typeof entry !== 'object') return null;
+
+  const rich = decodeHtmlEntities(entry.richSyncLyrics || '').trim();
+  if (rich) {
+    const dynamicLines = parseDynamicLrc(rich);
+    if (dynamicLines.length) {
+      const lrc = buildLrcFromDynamic(dynamicLines);
+      if (lrc.trim()) {
+        return { lyrics: lrc, dynamicLines, animated_lyrics: null, candidates: [], offset_ms: 0 };
+      }
+    }
+  }
+
+  const synced = decodeHtmlEntities(entry.syncedLyrics || '').trim();
+  if (synced) {
+    return { lyrics: synced, dynamicLines: null, animated_lyrics: null, candidates: [], offset_ms: 0 };
+  }
+
+  const plain = decodeHtmlEntities(entry.plainLyric || '').trim();
+  if (plain) {
+    return { lyrics: plain, dynamicLines: null, animated_lyrics: null, candidates: [], offset_ms: 0 };
+  }
+
+  return null;
+};
+
+export const fetchFromSimpMusic = async (params = {}) => {
+  const videoId = String(params.video_id || '').trim();
+  // videoId でしか引けない。曲名しか無い場面では黙って諦める。
+  if (!videoId) return null;
+
+  const res = await fetch(`${SIMPMUSIC_ENDPOINT}/${encodeURIComponent(videoId)}`, {
+    method: 'GET',
+    cache: 'no-store',
+  });
+  // 404 は「この動画の歌詞は登録が無い」。異常ではないので警告も出さない。
+  if (!res.ok) return null;
+
+  const json = await res.json();
+  const items = Array.isArray(json?.data) ? json.data : [];
+  const best = pickBestSimpMusicEntry(items);
+  const converted = convertSimpMusicEntry(best);
+  if (converted) YTMLog.log('[BG] SimpMusic hit:', videoId, best?.songTitle || '');
+  return converted;
+};
+
+// ── LyricsPlus ───────────────────────────────────────────────
+// 無料ホスティングの上限に当たって 429 / 402 を返すミラーが常時いる。
+// 一斉に投げて最初に歌詞を返したものを採る。
+export const LYRICSPLUS_MIRRORS = [
+  'https://lyricsplus.prjktla.my.id',
+  'https://lyricsplus.prjktla.workers.dev',
+  'https://lyricsplus-seven.vercel.app',
+];
+
+const LYRICSPLUS_COOLDOWN_MS = 5 * 60 * 1000;
+const lyricsPlusSkipUntil = new Map();
+
+export const convertLyricsPlusResponse = (json) => {
+  const rows = Array.isArray(json?.lyrics) ? json.lyrics : [];
+  if (!rows.length) return null;
+
+  const dynamicLines = [];
+  let hasSyllables = false;
+
+  for (const row of rows) {
+    const chars = [];
+    const syllabus = Array.isArray(row?.syllabus) ? row.syllabus : [];
+    for (const syllable of syllabus) {
+      const t = toFiniteMs(syllable?.time);
+      const c = String(syllable?.text ?? '');
+      if (t === null || !c) continue;
+      chars.push({ t, c });
+    }
+    if (chars.length) hasSyllables = true;
+
+    const startTimeMs = toFiniteMs(row?.time) ?? (chars.length ? chars[0].t : null);
+    if (startTimeMs === null) continue;
+
+    const text = String(row?.text ?? '') || chars.map(ch => ch.c).join('');
+    dynamicLines.push({ startTimeMs, text, chars });
+  }
+
+  if (!dynamicLines.length) return null;
+
+  const lyrics = buildLrcFromDynamic(dynamicLines);
+  if (!lyrics.trim()) return null;
+
+  return {
+    lyrics,
+    // 音節が1つも無ければ行同期でしかない。chars 空の配列を渡すと
+    // UI 側の「文字同期あり」判定を通らないまま無駄に持ち回ることになる。
+    dynamicLines: hasSyllables ? dynamicLines : null,
+    animated_lyrics: null,
+    candidates: [],
+    offset_ms: 0,
+  };
+};
+
+const fetchLyricsPlusFromMirror = async (base, query) => {
+  if (Date.now() < (lyricsPlusSkipUntil.get(base) || 0)) return null;
+  try {
+    const res = await fetch(`${base}/v2/lyrics/get?${query}`, {
+      method: 'GET',
+      cache: 'no-store',
+    });
+    if (res.status === 404) return null;          // 単に持っていない
+    if (!res.ok) {
+      // 402(Vercel の停止) / 429(Workers の上限) は当面ずっと同じ。
+      // 曲が変わるたびに叩き直しても待たされるだけなので少し休ませる。
+      lyricsPlusSkipUntil.set(base, Date.now() + LYRICSPLUS_COOLDOWN_MS);
+      return null;
+    }
+    const json = await res.json();
+    if (json?.error) return null;
+    return convertLyricsPlusResponse(json);
+  } catch (e) {
+    lyricsPlusSkipUntil.set(base, Date.now() + LYRICSPLUS_COOLDOWN_MS);
+    return null;
+  }
+};
+
+export const fetchFromLyricsPlus = async (params = {}) => {
+  const title = String(params.track || '').trim();
+  const artist = String(params.artist || '').trim();
+  if (!title || !artist) return null;
+
+  const search = new URLSearchParams({ title, artist });
+  const album = String(params.album || '').trim();
+  if (album) search.set('album', album);
+  const duration = Number(params.duration);
+  if (Number.isFinite(duration) && duration > 0) {
+    search.set('duration', String(Math.round(duration)));
+  }
+  const query = search.toString();
+
+  // 全ミラーを同時に投げ、最初に歌詞を返したものを採用する。
+  const result = await new Promise(resolve => {
+    let pending = LYRICSPLUS_MIRRORS.length;
+    let settled = false;
+    if (!pending) { resolve(null); return; }
+    for (const base of LYRICSPLUS_MIRRORS) {
+      fetchLyricsPlusFromMirror(base, query)
+        .then(value => {
+          pending -= 1;
+          if (value && !settled) {
+            settled = true;
+            YTMLog.log('[BG] LyricsPlus hit:', base);
+            resolve(value);
+          } else if (pending === 0 && !settled) {
+            settled = true;
+            resolve(null);
+          }
+        })
+        .catch(() => {
+          pending -= 1;
+          if (pending === 0 && !settled) {
+            settled = true;
+            resolve(null);
+          }
+        });
+    }
+  });
+
+  return result;
+};

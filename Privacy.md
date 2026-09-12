@@ -17,9 +17,10 @@ We use the Chrome Storage API to save the following data locally on your browser
 To provide specific features, the extension sends limited data to the following third-party APIs. We do not transmit personally identifiable information (PII) like your real name or email address to these services, except for authentication tokens where necessary for Cloud Sync.
 
 - **Lyrics Fetching:**
-  - **Services:** LRCLib (lrclib.net), LRCHub (lrchub.coreone.work)
-  - **Data Sent:** Song title, artist name, and album name.
+  - **Services:** LRCHub (lrchub.coreone.work), LRCLib (lrclib.net), SimpMusic Lyrics (api-lyrics.simpmusic.org), LyricsPlus (lyricsplus.prjktla.my.id and its mirrors)
+  - **Data Sent:** Song title, artist name, album name, track duration, and — for SimpMusic Lyrics — the YouTube video ID of the track you are playing.
   - **Purpose:** To search for and download synchronized lyrics.
+  - **Note:** These services are only queried when LRCHub cannot supply lyrics for the track.
 
 - **Lyrics Fetching from YouTube Music:**
   - **Service:** YouTube Music (music.youtube.com)

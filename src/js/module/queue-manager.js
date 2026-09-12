@@ -1,3 +1,9 @@
+// キューを開くまでに帯の上で留まる時間。
+// 帯は右端 52px。単一モニタなら画面の端がカーソルを止めるので広くても
+// 困らないが、デュアルモニタで左にウィンドウを置くと、隣のモニタへ
+// 移動する途中でここを横切る。掠めただけで開かないようにする。
+const QUEUE_OPEN_DWELL_MS = 160;
+
   const QueueManager = {
     observer: null,
 
@@ -84,6 +90,9 @@
           artist: artist,
           youtube_url: youtubeUrl,
           video_id: videoId,
+          // 先読みも本再生と同じ取得元で引く。渡し忘れると
+          // 「新ソースのみ」にしていても先読みだけ LRCHub を叩いてしまう。
+          lyric_source_mode: (typeof config !== 'undefined' && config.lyricSourceMode) || 'ytm',
         }
       }, (res) => {
         this._prefetchInFlight.delete(key);
@@ -303,10 +312,27 @@
         }
       };
 
-      trigger.addEventListener('mouseenter', openPanel);
+      // 入った瞬間には開かない。帯を広げた(52px)ので、隣のモニタへ
+      // 移動する途中や、右端のスクロールバーを掴みに行く途中で
+      // 掠めただけでも開いてしまうため。
+      // 少し留まった時だけ「開きたい」とみなす。
+      let dwellTimer = null;
+      const cancelDwell = () => {
+        if (dwellTimer) clearTimeout(dwellTimer);
+        dwellTimer = null;
+      };
+      trigger.addEventListener('mouseenter', () => {
+        cancelDwell();
+        dwellTimer = setTimeout(() => {
+          dwellTimer = null;
+          // 離れたあとに発火しても困るので、まだ乗っているか確かめる
+          if (trigger.matches(':hover')) openPanel();
+        }, QUEUE_OPEN_DWELL_MS);
+      });
       panel.addEventListener('mouseenter', () => clearTimeout(leaveTimer));
       panel.addEventListener('mouseleave', () => closePanel(false));
       trigger.addEventListener('mouseleave', () => {
+        cancelDwell();
         setTimeout(() => {
           if (!panel.matches(':hover')) closePanel(false);
         }, 100);

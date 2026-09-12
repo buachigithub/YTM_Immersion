@@ -93,6 +93,15 @@ function createBackgroundHarness({ api = {} } = {}) {
   return {
     responses,
     sentMessages,
+    // 表示中の歌詞を差し替える通知だけを数える。取得元をまたいだ候補の
+    // 追加通知(LYRICS_META_UPDATE)は同じ chrome.tabs.sendMessage を通るが、
+    // 歌詞には触れないので「差し替えが起きていないこと」の判定には入れない。
+    get lyricsUpdates() {
+      return sentMessages.filter(entry => entry.message?.type === 'LYRICS_DATA_UPDATE')
+    },
+    get candidateUpdates() {
+      return sentMessages.filter(entry => entry.message?.type === 'LYRICS_META_UPDATE')
+    },
     dispatch(payload) {
       const keepChannelOpen = messageListeners[0](
         { type: 'GET_LYRICS', payload },
@@ -149,7 +158,7 @@ test('standard mode responds once with LrcLib fallback, then pushes a late LRCHu
   assert.equal(harness.responses[0].fallbackUsed, true)
   assert.equal(harness.responses[0].lyrics, '[00:01.00]fallback line')
   assertRequestIdentity(harness.responses[0])
-  assert.equal(harness.sentMessages.length, 0)
+  assert.equal(harness.lyricsUpdates.length, 0)
 
   primaryHub.resolve({
     lyrics: '[00:01.00]hub line',
@@ -161,8 +170,8 @@ test('standard mode responds once with LrcLib fallback, then pushes a late LRCHu
   await flushMicrotasks()
 
   assert.equal(harness.responses.length, 1, 'late Hub data must not call sendResponse again')
-  assert.equal(harness.sentMessages.length, 1, 'late Hub data must emit exactly one update')
-  const update = harness.sentMessages[0]
+  assert.equal(harness.lyricsUpdates.length, 1, 'late Hub data must emit exactly one update')
+  const update = harness.lyricsUpdates[0]
   assert.equal(update.tabId, 7)
   assert.equal(update.message.type, 'LYRICS_DATA_UPDATE')
   assert.equal(update.message.payload.lyricsSource, 'lrchub')
@@ -197,7 +206,7 @@ test('a later character-synced Hub result upgrades an earlier line-synced Hub re
   assert.equal(harness.responses[0].lyricsQuality, 2)
   assert.equal(harness.responses[0].dynamicLines, null)
   assertRequestIdentity(harness.responses[0])
-  assert.equal(harness.sentMessages.length, 0)
+  assert.equal(harness.lyricsUpdates.length, 0)
 
   searchHub.resolve({
     lyrics: '[00:01.00]character synced',
@@ -212,9 +221,9 @@ test('a later character-synced Hub result upgrades an earlier line-synced Hub re
   await flushMicrotasks()
 
   assert.equal(harness.responses.length, 1)
-  assert.equal(harness.sentMessages.length, 1)
-  const updatePayload = harness.sentMessages[0].message.payload
-  assert.equal(harness.sentMessages[0].message.type, 'LYRICS_DATA_UPDATE')
+  assert.equal(harness.lyricsUpdates.length, 1)
+  const updatePayload = harness.lyricsUpdates[0].message.payload
+  assert.equal(harness.lyricsUpdates[0].message.type, 'LYRICS_DATA_UPDATE')
   assert.equal(updatePayload.sourceLabel, 'LRCHub search')
   assert.equal(updatePayload.lyricsQuality, 4)
   assert.equal(updatePayload.dynamicLines[0].chars.length, 2)
@@ -244,7 +253,9 @@ test('a later srv3 result upgrades an earlier DynamicLRC response', async () => 
 
   assert.equal(harness.responses.length, 1)
   assert.equal(harness.responses[0].lyricsQuality, 4)
-  assert.equal(harness.sentMessages.length, 0)
+  // 取得元をまたいだ候補提示(LYRICS_META_UPDATE)も同じ経路で飛ぶので、
+  // 歌詞の差し替え(LYRICS_DATA_UPDATE)だけを数える。
+  assert.equal(harness.lyricsUpdates.length, 0)
 
   const srv3 = '<timedtext format="3"><body><p t="1000" d="500">animated</p></body></timedtext>'
   searchHub.resolve({
@@ -254,8 +265,8 @@ test('a later srv3 result upgrades an earlier DynamicLRC response', async () => 
   await flushMicrotasks()
 
   assert.equal(harness.responses.length, 1)
-  assert.equal(harness.sentMessages.length, 1)
-  const updatePayload = harness.sentMessages[0].message.payload
+  assert.equal(harness.lyricsUpdates.length, 1)
+  const updatePayload = harness.lyricsUpdates[0].message.payload
   assert.equal(updatePayload.lyricsQuality, 5)
   assert.equal(updatePayload.animated_lyrics, srv3)
   assert.equal(updatePayload.sourceLabel, 'LRCHub search')

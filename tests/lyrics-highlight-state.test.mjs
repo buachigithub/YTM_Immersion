@@ -14,6 +14,13 @@ assert.notEqual(functionStart, -1, 'updateLyricHighlight should be present')
 assert.notEqual(functionEnd, -1, 'updateLyricHighlight end marker should be present')
 const updateSource = lyricsUiSource.slice(functionStart, functionEnd)
 
+// 「いまの行を次の行まで明るく保つ」判断は updateLyricHighlight の外にある。
+// コピーを置くと本体とずれるので、実物を切り出して一緒に動かす。
+const litStart = lyricsUiSource.indexOf('const isPrimaryRowLitAtTime')
+const litEnd = lyricsUiSource.indexOf('const isSameTimestamp', litStart)
+assert.notEqual(litStart, -1, 'isPrimaryRowLitAtTime should be present')
+const litSource = lyricsUiSource.slice(litStart, litEnd)
+
 class FakeClassList {
   constructor(...names) {
     this.names = new Set(names)
@@ -84,6 +91,7 @@ function createHighlightHarness(lyricsData, hasDynamicRanges) {
   }
 
   vm.runInNewContext(`
+    ${litSource}
     let lastActiveIndex = -1;
     let _hasDynamicRenderRanges = ${hasDynamicRanges ? 'true' : 'false'};
     let _previousActiveIndices = new Set();
@@ -119,17 +127,22 @@ test('DynamicLRC rows fade after their own end and recover after a backward seek
     { active: true, past: false },
     { active: false, past: false },
   ])
+  // 歌い終わっても、次の行が始まるまでは明るいまま残す。
+  // ここで active を外すと色が #fff → rgba(255,255,255,0.3)、大きさが
+  // 1.05 → 0.95 に落ち、文字同期では塗りのグラデーションごと消える。
+  // 行間が空く曲ではそれが数秒続き、点いて消えて点いて消えて、に見える。
   assert.deepEqual(harness.runAt(3, 0), [
-    { active: false, past: true },
+    { active: true, past: false },
     { active: false, past: false },
   ])
   assert.deepEqual(harness.runAt(8.5, 1), [
     { active: false, past: true },
     { active: true, past: false },
   ])
+  // 最後の行も同じ。次が無いので明るいまま画面に残る
   assert.deepEqual(harness.runAt(10, 1), [
     { active: false, past: true },
-    { active: false, past: true },
+    { active: true, past: false },
   ])
   assert.deepEqual(harness.runAt(1.5, 0), [
     { active: true, past: false },
