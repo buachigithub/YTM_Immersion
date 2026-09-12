@@ -204,8 +204,6 @@ const YTMLog = (() => {
     // Apple Music 風の文字同期(グラデーションで塗る + 光が尾を引く)。
     // 既定 ON。従来の二値表示に戻したい人は設定から切る。
     appleSyncStyle: true,
-    // 歌詞をどこから取ったかを画面隅に出す。既定オフ。
-    showLyricsSource: false,
     useSingerColors: true,
     useLrcLibFallback: true,
     lyricSourceMode: 'standard',
@@ -260,7 +258,6 @@ const YTMLog = (() => {
       settings_source_ytm: "YouTube Music 優先",
       settings_source_lrchub: "LRC Hub 優先",
       settings_apple_sync: "Apple Music 風の文字同期",
-      settings_show_source: "いまの取得元を画面に表示する",
       settings_keep_past_lyrics: "再生済みの歌詞を残す",
     },
     en: {
@@ -306,7 +303,6 @@ const YTMLog = (() => {
       settings_source_ytm: "Prefer YouTube Music",
       settings_source_lrchub: "Prefer LRC Hub",
       settings_apple_sync: "Apple Music style word sync",
-      settings_show_source: "Show the current lyrics source on screen",
       settings_keep_past_lyrics: "Keep already-played lyrics visible",
     },
     ko: {
@@ -352,7 +348,6 @@ const YTMLog = (() => {
       settings_source_ytm: "YouTube Music 우선",
       settings_source_lrchub: "LRC Hub 우선",
       settings_apple_sync: "Apple Music 스타일 글자 동기화",
-      settings_show_source: "현재 가사 소스를 화면에 표시",
       settings_keep_past_lyrics: "재생된 가사를 남겨두기",
     },
     zh: {
@@ -398,7 +393,6 @@ const YTMLog = (() => {
       settings_source_ytm: "优先 YouTube Music",
       settings_source_lrchub: "优先 LRC Hub",
       settings_apple_sync: "Apple Music 风格逐字同步",
-      settings_show_source: "在画面上显示当前歌词来源",
       settings_keep_past_lyrics: "保留已播放的歌词",
     }
   }; 

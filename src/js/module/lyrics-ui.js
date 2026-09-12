@@ -2154,11 +2154,14 @@ function enqueueLyricsCacheWrite(key, createValue, isCurrent) {
 // ── 取得元の表示 ──────────────────────────────────────────
 // 歌詞の出どころは LRCHub / YouTube Music / SimpMusic / LyricsPlus / LRCLIB と
 // 増えたうえ、同じ曲でも「先に返した方が勝つ」ので実行のたびに変わりうる。
-// 画面に出すかどうかは設定「いまの取得元を画面に表示する」だけで決める。
-// 以前はデバッグ(ytm_debug)でも強制的に出していたが、フラグを立てた人は
-// コンソールを見に行くのであって、画面の隅に居座らせてほしいわけではない。
-// しかも設定を切っても消せないので、消し方が分からなくなる。
-// デバッグで増えるのはコンソールへの記録だけにする。
+// 出し方はひと通りだけ: 手を動かした時に出て、止まれば引っ込む
+// (body.ytm-pointer-active)。設定は置かない。
+// 以前は「いまの取得元を画面に表示する」という設定があったが、手を動かした
+// 時だけ出す方式にした時点で、OFF でも出るのに名前は「表示する」のままという
+// 嘘になっていた。聴いている間は出ず、触れば出るなら、切りたい理由が無い。
+// 選ばせる必要のない物を設定に並べない。
+// デバッグ(ytm_debug)で増えるのはコンソールへの記録だけ。画面には出さない。
+// フラグを立てた人が欲しいのは記録であって、消せない常設表示ではない。
 const LYRICS_SOURCE_LABELS = {
   lrchub: 'LRCHub',
   lrclib: 'LRCLIB',
@@ -2278,7 +2281,7 @@ function updateLyricsSourceDebugBadge(payload) {
     YTMLog.log('[CS] 歌詞ソース:', currentLyricsSource, payload?.sourceLabel || '');
   }
   // 取得元が分からない間は置かない
-  if (!currentLyricsSource && !config.showLyricsSource) {
+  if (!currentLyricsSource) {
     document.getElementById('ytm-lyrics-source-debug')?.remove();
     return;
   }
@@ -2310,14 +2313,6 @@ function updateLyricsSourceDebugBadge(payload) {
       document.body.appendChild(el);
     }
   }
-  // 設定 ON の時だけ出しっぱなし。既定はマウスを動かした時だけ出す
-  el.classList.toggle('ytm-source-pinned', !!config.showLyricsSource);
-
-  if (!currentLyricsSource) {
-    el.textContent = '歌詞ソース: —';
-    return;
-  }
-
   // sourceLabel は background が付ける実際に当たった経路名
   // (例: 'LRCHub search' / 'LRCHub retry')。無ければ ID から引く。
   const label = (typeof payload?.sourceLabel === 'string' && payload.sourceLabel.trim())
@@ -5935,8 +5930,6 @@ async function initSettings() {
   if (animatedCaptionStored !== null) config.useAnimatedCaptions = !!animatedCaptionStored;
   const appleSyncStored = await storage.get('ytm_apple_sync_style');
   if (appleSyncStored !== null) config.appleSyncStyle = !!appleSyncStored;
-  const sourceBadgeStored = await storage.get('ytm_lyrics_source_badge');
-  if (sourceBadgeStored !== null) config.showLyricsSource = !!sourceBadgeStored;
   const singerColorsStored = await storage.get('ytm_singer_colors_enabled');
   if (singerColorsStored !== null) config.useSingerColors = !!singerColorsStored;
   const sourceModeStored = await storage.get('ytm_lyric_source_mode');
@@ -6194,10 +6187,6 @@ function renderSettingsPanel() {
                   <button class="ytm-lang-pill" data-value="lrchub">${t('settings_source_lrchub')}</button>
                 </div>
               </div>
-              <label class="setting-row toggle-label">
-                <span class="setting-name">${t('settings_show_source')}</span>
-                <input type="checkbox" id="show-source-toggle">
-              </label>
             </div>
           </div>
 
@@ -6325,7 +6314,6 @@ function renderSettingsPanel() {
   document.getElementById('apple-bg-toggle').checked = !!config.appleBg;
   document.getElementById('low-cpu-toggle').checked = !!config.lowCpuMode;
   document.getElementById('apple-sync-toggle').checked = !!config.appleSyncStyle;
-  document.getElementById('show-source-toggle').checked = !!config.showLyricsSource;
   document.getElementById('animated-caption-toggle').checked = !!config.useAnimatedCaptions;
   document.getElementById('singer-colors-toggle').checked = !!config.useSingerColors;
   document.getElementById('meaning-always-toggle').checked = !!config.alwaysShowMeaning;
@@ -6443,7 +6431,6 @@ function renderSettingsPanel() {
     config.appleBg = document.getElementById('apple-bg-toggle').checked;
     config.lowCpuMode = document.getElementById('low-cpu-toggle').checked;
     config.appleSyncStyle = document.getElementById('apple-sync-toggle').checked;
-    config.showLyricsSource = document.getElementById('show-source-toggle').checked;
     config.useAnimatedCaptions = document.getElementById('animated-caption-toggle').checked;
     config.useSingerColors = document.getElementById('singer-colors-toggle').checked;
     config.alwaysShowMeaning = document.getElementById('meaning-always-toggle').checked;
@@ -6466,7 +6453,6 @@ function renderSettingsPanel() {
       storage.set('ytm_apple_bg', config.appleBg),
       storage.set('ytm_low_cpu_mode', config.lowCpuMode),
       storage.set('ytm_apple_sync_style', config.appleSyncStyle),
-      storage.set('ytm_lyrics_source_badge', config.showLyricsSource),
       storage.set('ytm_animated_captions_enabled', config.useAnimatedCaptions),
       storage.set('ytm_singer_colors_enabled', config.useSingerColors),
       storage.set('ytm_lrclib_fallback', config.useLrcLibFallback),
@@ -6488,8 +6474,6 @@ function renderSettingsPanel() {
     document.body.classList.toggle('ytm-lightweight-mode', !!config.lowCpuMode);
     document.body.classList.toggle('ytm-singer-colors-enabled', !!config.useSingerColors);
     applyAppleSyncClass();
-    // 保存した瞬間に出す/消す(曲が変わるまで待たせない)
-    updateLyricsSourceDebugBadge(null);
     if (PipManager.pipWindow?.document) {
       PipManager.pipWindow.document.body.classList.toggle('ytm-keep-past-lyrics', !!config.keepPastLyrics);
       PipManager.pipWindow.document.body.classList.toggle('ytm-singer-colors-enabled', !!config.useSingerColors);
@@ -7042,8 +7026,6 @@ async function loadLyrics(meta, options = {}) {
   if (animatedCaptionStored !== null && animatedCaptionStored !== undefined) config.useAnimatedCaptions = !!animatedCaptionStored;
   const appleSyncStored = await storage.get('ytm_apple_sync_style');
   if (appleSyncStored !== null && appleSyncStored !== undefined) config.appleSyncStyle = !!appleSyncStored;
-  const sourceBadgeStored = await storage.get('ytm_lyrics_source_badge');
-  if (sourceBadgeStored !== null && sourceBadgeStored !== undefined) config.showLyricsSource = !!sourceBadgeStored;
   applyAppleSyncClass();
   const sourceModeStored = await storage.get('ytm_lyric_source_mode');
   config.lyricSourceMode = normalizeSourceMode(sourceModeStored);
@@ -8940,7 +8922,6 @@ const runtimeSettingsReady = (async function applySavedRuntimeSettings() {
     savedAnimatedCaptions,
     savedSingerColors,
     savedAppleSync,
-    savedSourceBadge,
   ] = await Promise.all([
     storage.get('ytm_sync_offset'),
     storage.get('ytm_save_sync_offset'),
@@ -8949,7 +8930,6 @@ const runtimeSettingsReady = (async function applySavedRuntimeSettings() {
     storage.get('ytm_animated_captions_enabled'),
     storage.get('ytm_singer_colors_enabled'),
     storage.get('ytm_apple_sync_style'),
-    storage.get('ytm_lyrics_source_badge'),
   ]);
   if (savedOffset !== null && Number.isFinite(Number(savedOffset))) config.syncOffset = Number(savedOffset);
   if (savedOffsetEnabled !== null) config.saveSyncOffset = !!savedOffsetEnabled;
@@ -8957,7 +8937,6 @@ const runtimeSettingsReady = (async function applySavedRuntimeSettings() {
   config.lyricSourceMode = normalizeSourceMode(savedSourceMode);
   if (savedAnimatedCaptions !== null) config.useAnimatedCaptions = !!savedAnimatedCaptions;
   if (savedAppleSync !== null) config.appleSyncStyle = !!savedAppleSync;
-  if (savedSourceBadge !== null) config.showLyricsSource = !!savedSourceBadge;
   if (savedSingerColors !== null) config.useSingerColors = !!savedSingerColors;
   document.body.classList.toggle('ytm-singer-colors-enabled', !!config.useSingerColors);
   applyAppleSyncClass();
