@@ -21,7 +21,11 @@
     "https://api-free.deepl.com/*",
     "https://api.deepl.com/*",
     "http://127.0.0.1:5678/*",
-    "http://localhost:5678/*"
+    "http://localhost:5678/*",
+    "http://localhost:3946/*",
+    "http://127.0.0.1:3946/*",
+    "https://localhost:3946/*",
+    "https://127.0.0.1:3946/*"
   ],
   "background": {
     "service_worker": "src/js/background.js",

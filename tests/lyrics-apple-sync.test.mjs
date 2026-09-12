@@ -3,7 +3,7 @@ import fs from 'node:fs'
 import test from 'node:test'
 import vm from 'node:vm'
 
-const read = rel => fs.readFileSync(new URL(`../${rel}`, import.meta.url), 'utf8')
+const read = rel => fs.readFileSync(new URL(`../${rel}`, import.meta.url), 'utf8').replace(/\r\n/g, '\n')
 
 const lyricsUiSource = read('src/js/module/lyrics-ui.js')
 const namespaceSource = read('src/js/module/namespace.js')
@@ -772,10 +772,10 @@ test('選べるのは2つだけで、どちらも他所へ落ちられる', () =
     '2つ以外の値を返している(落ちない排他モードが復活していないか)')
 })
 
-test('設定画面に並ぶ取得元は2つ', () => {
+test('設定画面に並ぶ取得元', () => {
   const group = sourceBetween(lyricsUiSource, 'id="lyric-source-group"', '</div>')
   const pills = group.match(/data-value="[^"]+"/g) || []
-  assert.deepEqual(pills, ['data-value="ytm"', 'data-value="lrchub"'])
+  assert.deepEqual(pills, ['data-value="ytm"', 'data-value="lrchub"', 'data-value="kpoe"'])
 })
 
 test('撤去した「新ソースのみ」の名残が残っていない', () => {
