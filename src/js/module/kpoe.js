@@ -200,6 +200,30 @@ export const convertKpoeResponse = (data) => {
   if (!data || typeof data !== 'object') return null;
   if (String(data.status || '').toLowerCase() === 'error') return null;
 
+  if (typeof data.ttml === 'string' && data.ttml.trim()) {
+    const metadata = (data.metadata && typeof data.metadata === 'object') ? data.metadata : {};
+    return {
+      success: true,
+      lyrics: data.ttml,
+      dynamicLines: null,
+      animated_lyrics: null,
+      subLyrics: '',
+      lyricsSource: 'kpoe',
+      sourceLabel: 'Custom KPoe',
+      fallbackUsed: false,
+      lyricsQuality: 4,
+      offset_ms: 0,
+      kpoe: {
+        type: 'word',
+        source: String(metadata.source || 'apple').trim(),
+        title: String(metadata.title || '').trim(),
+        artist: String(metadata.artist || '').trim(),
+        language: String(metadata.language || '').trim(),
+        duet: false,
+      },
+    };
+  }
+
   const entries = normalizeKpoeLines(data.lyrics);
   if (!entries.length) return null;
 

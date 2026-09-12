@@ -1459,6 +1459,18 @@ const LYRICSPLUS_COOLDOWN_MS = 5 * 60 * 1000;
 const lyricsPlusSkipUntil = new Map();
 
 export const convertLyricsPlusResponse = (json) => {
+  if (!json || typeof json !== 'object') return null;
+
+  if (typeof json.ttml === 'string' && json.ttml.trim()) {
+    return {
+      lyrics: json.ttml,
+      dynamicLines: null,
+      animated_lyrics: null,
+      candidates: [],
+      offset_ms: 0,
+    };
+  }
+
   const rows = Array.isArray(json?.lyrics) ? json.lyrics : [];
   if (!rows.length) return null;
 

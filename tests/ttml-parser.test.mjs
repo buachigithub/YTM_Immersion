@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { parseTime, isTTMLString, parseTTML } from '../src/js/module/ttml-parser.js';
+import TTMLParser from '../src/js/module/ttml-parser.js';
+const { parseTime, isTTMLString, parseTTML } = TTMLParser;
 
 test('parseTime converts various time formats to seconds', () => {
   assert.equal(parseTime('00:01:23.456'), 83.456);

@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { performStaggerScroll } from '../src/js/module/lyric-stagger.js';
+import LyricStagger from '../src/js/module/lyric-stagger.js';
+const { performStaggerScroll } = LyricStagger;
 
 test('performStaggerScroll performs FLIP translate animation on lyric rows', () => {
   const rows = [];
