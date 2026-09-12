@@ -1,5 +1,6 @@
 import * as CloudSync from './module/bg-cloud-sync.js';
 import * as API from './module/api.js';
+import * as KPoe from './module/kpoe.js';
 
 // ── デバッグログ ────────────────────────────────────────────
 // Service Worker には localStorage が無いので chrome.storage を見る。
@@ -202,11 +203,16 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
       artist,
       youtube_url,
       video_id,
+      duration,
+      album,
       use_lrclib = true,
       offset_ms,
       translate_to,
       translation_source,
       lyric_source_mode = 'standard',
+      kpoe_enabled = false,
+      kpoe_base_url,
+      kpoe_source,
       request_id,
       track_key,
     } = req.payload || {};
@@ -271,7 +277,7 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
         ...requestIdentity,
       });
 
-      const buildHubLyricsPayload = (hubRes, sourceLabel) => {
+      const buildHubLyricsPayload = (hubRes, sourceLabel, sourceId = 'lrchub') => {
         const candidates = Array.isArray(hubRes.candidates) ? hubRes.candidates : [];
         const meaningData = hubRes.meaningData || API.normalizeLrchubMeaningPayload(hubRes);
         return {
@@ -297,7 +303,7 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
             // translations to the selected video's timeline.
             ...API.normalizeLrchubTranslations(hubRes.lrcMap)
           },
-          lyricsSource: 'lrchub',
+          lyricsSource: sourceId,
           sourceLabel,
           fallbackUsed: false,
           lyricsQuality: getHubLyricsQuality(hubRes),
@@ -380,13 +386,41 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
         return;
       }
 
+      // Custom KPoe を優先する設定では、まず KPoe を試す。
+      // 未登録・接続不能なら以降の標準フロー（LRCHub 等）へそのまま落ちる。
+      const kpoeEnabled = !!kpoe_enabled;
+      if (lyric_source_mode === 'kpoe' && kpoeEnabled) {
+        try {
+          const kpoeRes = await API.withTimeout(
+            KPoe.fetchKpoeLyrics({
+              title: track,
+              artist,
+              duration,
+              album,
+              videoId: resolvedVideoId,
+              baseUrl: kpoe_base_url,
+              source: kpoe_source,
+            }),
+            8000,
+            'kpoe'
+          );
+          if (kpoeRes && typeof kpoeRes.lyrics === 'string' && kpoeRes.lyrics.trim()) {
+            YTMLog.log('[BG] Won: Custom KPoe');
+            sendOnce(buildHubLyricsPayload(kpoeRes, 'Custom KPoe', 'kpoe'));
+            return;
+          }
+        } catch (e) {
+          console.warn('[BG] KPoe fetch failed:', e);
+        }
+      }
+
       let deliveredHubQuality = 0;
       const resolvedHubResults = [];
 
-      const sendHubLyrics = (hubRes, sourceLabel) => {
+      const sendHubLyrics = (hubRes, sourceLabel, sourceId = 'lrchub') => {
         YTMLog.log(`[BG] Won: ${sourceLabel}`);
         deliveredHubQuality = Math.max(deliveredHubQuality, getHubLyricsQuality(hubRes));
-        sendOnce(buildHubLyricsPayload(hubRes, sourceLabel));
+        sendOnce(buildHubLyricsPayload(hubRes, sourceLabel, sourceId));
       };
 
       const pushHubUpgrade = async (hubResult) => {
@@ -538,6 +572,33 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
           await pushHubUpgrade(lateHub);
         }
         return;
+      }
+
+      // どのソースも歌詞を返せなかったときの最後の受け皿として KPoe を試す
+      // （KPoe を有効にしていて、優先設定が kpoe 以外のとき）。
+      if (kpoeEnabled && lyric_source_mode !== 'kpoe') {
+        try {
+          const kpoeRes = await API.withTimeout(
+            KPoe.fetchKpoeLyrics({
+              title: track,
+              artist,
+              duration,
+              album,
+              videoId: resolvedVideoId,
+              baseUrl: kpoe_base_url,
+              source: kpoe_source,
+            }),
+            6000,
+            'kpoe fallback'
+          );
+          if (kpoeRes && typeof kpoeRes.lyrics === 'string' && kpoeRes.lyrics.trim()) {
+            YTMLog.log('[BG] Won (last resort): Custom KPoe');
+            sendHubLyrics(kpoeRes, 'Custom KPoe', 'kpoe');
+            return;
+          }
+        } catch (e) {
+          console.warn('[BG] KPoe fallback failed:', e);
+        }
       }
 
       YTMLog.log('[BG] No lyrics found');

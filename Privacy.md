@@ -21,6 +21,11 @@ To provide specific features, the extension sends limited data to the following 
   - **Data Sent:** Song title, artist name, and album name.
   - **Purpose:** To search for and download synchronized lyrics.
 
+- **Lyrics Fetching from Custom KPoe (Optional):**
+  - **Service:** A user-configured Custom KPoe / LyricsPlus compatible server (disabled by default; default address `http://localhost:3946`).
+  - **Data Sent:** Song title, artist name, album name, duration, and the YouTube video ID.
+  - **Purpose:** To retrieve syllable/character-synchronized lyrics. No data is sent unless you explicitly enable this source and set its address.
+
 - **Lyrics Fetching from YouTube Music:**
   - **Service:** YouTube Music (music.youtube.com)
   - **Data Sent:** The video ID of the track you are playing, and the song title and artist name when we need to locate the corresponding catalog track.

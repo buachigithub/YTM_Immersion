@@ -903,7 +903,8 @@ const DEFAULT_BG_BRIGHTNESS = 0.65;
 const normalizeSourceMode = (value) => (
   (value === 'ytm' || value === 'ytm_only') ? 'ytm'
     : (value === 'lrchub') ? 'lrchub'
-      : 'ytm'
+      : (value === 'kpoe') ? 'kpoe'
+        : 'ytm'
 );
 
 // いま表示している歌詞が「YTM優先」設定によって選ばれたものか。
@@ -4510,6 +4511,10 @@ async function initSettings() {
   if (singerColorsStored !== null) config.useSingerColors = !!singerColorsStored;
   const sourceModeStored = await storage.get('ytm_lyric_source_mode');
   config.lyricSourceMode = normalizeSourceMode(sourceModeStored);
+  const kpoeEnabledStored = await storage.get('ytm_kpoe_enabled');
+  if (kpoeEnabledStored !== null && kpoeEnabledStored !== undefined) config.kpoeEnabled = !!kpoeEnabledStored;
+  const kpoeBaseUrlStored = await storage.get('ytm_kpoe_base_url');
+  if (typeof kpoeBaseUrlStored === 'string' && kpoeBaseUrlStored.trim()) config.kpoeBaseUrl = kpoeBaseUrlStored.trim();
 
   const lowCpuStored = await storage.get('ytm_low_cpu_mode');
   if (lowCpuStored !== null) config.lowCpuMode = !!lowCpuStored;
@@ -4757,7 +4762,17 @@ function renderSettingsPanel() {
                 <div class="ytm-lang-group" id="lyric-source-group">
                   <button class="ytm-lang-pill" data-value="ytm">${t('settings_source_ytm')}</button>
                   <button class="ytm-lang-pill" data-value="lrchub">${t('settings_source_lrchub')}</button>
+                  <button class="ytm-lang-pill" data-value="kpoe">${t('settings_source_kpoe')}</button>
                 </div>
+              </div>
+              <label class="setting-row toggle-label">
+                <span class="setting-name">${t('settings_kpoe_enable')}</span>
+                <input type="checkbox" id="kpoe-enable-toggle">
+              </label>
+              <div class="setting-row stacked">
+                <span class="setting-name">${t('settings_kpoe_url')}</span>
+                <span class="setting-desc">${t('settings_kpoe_url_desc')}</span>
+                <input type="text" id="kpoe-url-input" class="setting-input-text" placeholder="http://localhost:3946" autocomplete="off" spellcheck="false">
               </div>
             </div>
           </div>
@@ -4888,6 +4903,10 @@ function renderSettingsPanel() {
   document.getElementById('animated-caption-toggle').checked = !!config.useAnimatedCaptions;
   document.getElementById('singer-colors-toggle').checked = !!config.useSingerColors;
   document.getElementById('meaning-always-toggle').checked = !!config.alwaysShowMeaning;
+  const kpoeEnableToggle = document.getElementById('kpoe-enable-toggle');
+  if (kpoeEnableToggle) kpoeEnableToggle.checked = !!config.kpoeEnabled;
+  const kpoeUrlInput = document.getElementById('kpoe-url-input');
+  if (kpoeUrlInput) kpoeUrlInput.value = config.kpoeBaseUrl || '';
 
   // 共有翻訳の残り文字数（保存済み値を表示）
   document.getElementById('sync-offset-input').valueAsNumber = config.syncOffset || 0;
@@ -4964,7 +4983,9 @@ function renderSettingsPanel() {
       savedUiLang,
       savedAnimatedCaptions,
       savedLrcLibFallback,
-      savedSourceMode
+      savedSourceMode,
+      savedKpoeEnabled,
+      savedKpoeBaseUrl
     ] = await Promise.all([
       storage.get('ytm_deepl_key'),
       storage.get('ytm_main_lang'),
@@ -4974,7 +4995,9 @@ function renderSettingsPanel() {
       storage.get('ytm_ui_lang'),
       storage.get('ytm_animated_captions_enabled'),
       storage.get('ytm_lrclib_fallback'),
-      storage.get('ytm_lyric_source_mode')
+      storage.get('ytm_lyric_source_mode'),
+      storage.get('ytm_kpoe_enabled'),
+      storage.get('ytm_kpoe_base_url')
     ]);
 
     const prevDeepLKey = savedDeepLKey || '';
@@ -4986,6 +5009,10 @@ function renderSettingsPanel() {
     const prevAnimatedCaptions = savedAnimatedCaptions !== null ? !!savedAnimatedCaptions : false;
     const prevUseLrcLibFallback = savedLrcLibFallback !== null ? !!savedLrcLibFallback : true;
     const prevSourceMode = savedSourceMode || 'standard';
+    const prevKpoeEnabled = savedKpoeEnabled !== null && savedKpoeEnabled !== undefined ? !!savedKpoeEnabled : false;
+    const prevKpoeBaseUrl = typeof savedKpoeBaseUrl === 'string' && savedKpoeBaseUrl.trim()
+      ? savedKpoeBaseUrl.trim()
+      : 'http://localhost:3946';
 
     // 画面から値を取得
     config.deepLKey = document.getElementById('deepl-key-input').value.trim();
@@ -4998,6 +5025,10 @@ function renderSettingsPanel() {
     config.useAnimatedCaptions = document.getElementById('animated-caption-toggle').checked;
     config.useSingerColors = document.getElementById('singer-colors-toggle').checked;
     config.alwaysShowMeaning = document.getElementById('meaning-always-toggle').checked;
+    const kpoeEnableEl = document.getElementById('kpoe-enable-toggle');
+    const kpoeUrlEl = document.getElementById('kpoe-url-input');
+    if (kpoeEnableEl) config.kpoeEnabled = kpoeEnableEl.checked;
+    if (kpoeUrlEl) config.kpoeBaseUrl = kpoeUrlEl.value.trim() || 'http://localhost:3946';
     config.lyricWeight = document.getElementById('weight-slider').value;
     config.bgBrightness = document.getElementById('bright-slider').value;
     config.uiScale = normalizeUiScale(document.getElementById('ui-scale-slider')?.value);
@@ -5028,7 +5059,9 @@ function renderSettingsPanel() {
       storage.set('ytm_ui_scale', config.uiScale),
       storage.set('ytm_sync_offset', config.syncOffset),
       storage.set('ytm_save_sync_offset', config.saveSyncOffset),
-      storage.set('ytm_lyric_source_mode', config.lyricSourceMode)
+      storage.set('ytm_lyric_source_mode', config.lyricSourceMode),
+      storage.set('ytm_kpoe_enabled', config.kpoeEnabled),
+      storage.set('ytm_kpoe_base_url', config.kpoeBaseUrl)
     ]);
 
     document.body.classList.toggle('ytm-align-left', !!config.leftAlignInfo);
@@ -5054,7 +5087,9 @@ function renderSettingsPanel() {
     const animatedCaptionsChanged = prevAnimatedCaptions !== config.useAnimatedCaptions;
     const lyricsSourceChanged = (
       prevSourceMode !== config.lyricSourceMode ||
-      prevUseLrcLibFallback !== config.useLrcLibFallback
+      prevUseLrcLibFallback !== config.useLrcLibFallback ||
+      prevKpoeEnabled !== config.kpoeEnabled ||
+      prevKpoeBaseUrl !== config.kpoeBaseUrl
     );
     const uiLanguageChanged = prevUiLang !== config.uiLang;
     const meaningAlwaysChanged = prevAlwaysShowMeaning !== config.alwaysShowMeaning;
@@ -5584,6 +5619,10 @@ async function loadLyrics(meta, options = {}) {
   if (animatedCaptionStored !== null && animatedCaptionStored !== undefined) config.useAnimatedCaptions = !!animatedCaptionStored;
   const sourceModeStored = await storage.get('ytm_lyric_source_mode');
   config.lyricSourceMode = normalizeSourceMode(sourceModeStored);
+  const kpoeEnabledStored = await storage.get('ytm_kpoe_enabled');
+  if (kpoeEnabledStored !== null && kpoeEnabledStored !== undefined) config.kpoeEnabled = !!kpoeEnabledStored;
+  const kpoeBaseUrlStored = await storage.get('ytm_kpoe_base_url');
+  if (typeof kpoeBaseUrlStored === 'string' && kpoeBaseUrlStored.trim()) config.kpoeBaseUrl = kpoeBaseUrlStored.trim();
 
   const thisKey = `${meta.title}///${meta.artist}`;
   const requestVideoId = getCurrentVideoId() || '';
@@ -5713,13 +5752,23 @@ async function loadLyrics(meta, options = {}) {
     const youtube_url = getCurrentVideoUrl();
     const video_id = requestVideoId;
     const translate_to = getRequestedLrchubTranslateLangs();
+    // KPoe は duration / album を照合に使うため、再生中の video 要素と
+    // MediaSession のメタデータから渡せるだけ渡す。
+    const mediaEl = document.querySelector('video');
+    const duration = (mediaEl && Number.isFinite(mediaEl.duration) && mediaEl.duration > 0)
+      ? mediaEl.duration
+      : null;
     const payload = {
       track,
       artist,
+      album: meta.album || '',
+      duration,
       youtube_url,
       video_id,
       use_lrclib: config.useLrcLibFallback,
-      lyric_source_mode: config.lyricSourceMode || 'standard',
+      lyric_source_mode: config.lyricSourceMode || 'ytm',
+      kpoe_enabled: !!config.kpoeEnabled,
+      kpoe_base_url: config.kpoeBaseUrl || '',
       request_id: requestId,
       track_key: thisKey,
     };
@@ -7062,6 +7111,10 @@ const runtimeSettingsReady = (async function applySavedRuntimeSettings() {
   if (savedOffsetEnabled !== null) config.saveSyncOffset = !!savedOffsetEnabled;
   config.useLrcLibFallback = true;
   config.lyricSourceMode = normalizeSourceMode(savedSourceMode);
+  const savedKpoeEnabled = await storage.get('ytm_kpoe_enabled');
+  if (savedKpoeEnabled !== null && savedKpoeEnabled !== undefined) config.kpoeEnabled = !!savedKpoeEnabled;
+  const savedKpoeBaseUrl = await storage.get('ytm_kpoe_base_url');
+  if (typeof savedKpoeBaseUrl === 'string' && savedKpoeBaseUrl.trim()) config.kpoeBaseUrl = savedKpoeBaseUrl.trim();
   if (savedAnimatedCaptions !== null) config.useAnimatedCaptions = !!savedAnimatedCaptions;
   if (savedSingerColors !== null) config.useSingerColors = !!savedSingerColors;
   document.body.classList.toggle('ytm-singer-colors-enabled', !!config.useSingerColors);
