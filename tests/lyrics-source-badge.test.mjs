@@ -5,8 +5,11 @@
 // してマウスを動かすので、その瞬間に出す(body.ytm-pointer-active)。
 // 動画プレイヤーの操作盤と同じ作法。
 //
-// 設定「いまの取得元を画面に表示する」を ON にした人は出しっぱなし
-// (ytm-source-pinned)で、今までどおりの見え方になる。
+// 出し方はこのひと通りだけで、設定は置かない。かつて「いまの取得元を画面に
+// 表示する」という設定があったが、手を動かした時だけ出す方式にした時点で、
+// OFF でも出るのに名前は「表示する」のままという嘘になっていた。聴いている
+// 間は出ず、触れば出るなら、切りたい理由が無い。選ばせる必要のない物を設定に
+// 並べないこと。設定を戻すなら、まず OFF が本当に「出さない」かを決めること。
 //
 // デバッグ(ytm_debug)で画面に出してはいけない。フラグを立てた人が欲しいのは
 // コンソールへの記録であって、消せない常設表示ではない。
@@ -30,7 +33,7 @@ const end = uiSource.indexOf('function updateLyricsSourceState(payload')
 assert.ok(start !== -1 && end !== -1, '切り出しの目印が変わっていないか確認')
 const fnSource = uiSource.slice(start, end)
 
-const run = ({ showLyricsSource, debugEnabled, source = 'lrclib' }) => {
+const run = ({ debugEnabled, source = 'lrclib' }) => {
   let present = true
   let logged = 0
   let opened = 0
@@ -47,46 +50,43 @@ const run = ({ showLyricsSource, debugEnabled, source = 'lrclib' }) => {
     remove() { present = false },
   }
   const context = {
-    config: { showLyricsSource },
+    config: {},
     YTMLog: { enabled: debugEnabled, log() { logged += 1 } },
     currentLyricsSource: source,
     selectLyricsPayload: () => ({ quality: 2 }),
     createEl: () => el,
-    openLyricsMenu: () => { opened += 1 },
+    toggleLyricsMenu: () => { opened += 1 },
     LYRICS_SOURCE_LABELS: { lrclib: 'LRCLIB' },
     LYRICS_QUALITY_LABELS: ['', '時刻なし', '行同期'],
     document: { body: {}, getElementById: () => (present ? el : null) },
   }
   vm.runInNewContext(`${fnSource}\nupdateLyricsSourceDebugBadge({});`, context)
-  return { present, logged, opened, pinned: classes.has('ytm-source-pinned'), text: el.textContent }
+  return { present, logged, opened, classes: [...classes], text: el.textContent }
 }
 
-test('設定が ON なら出しっぱなしの印を付ける', () => {
-  const r = run({ showLyricsSource: true, debugEnabled: false })
+test('取得元が分かればバッジを用意する', () => {
+  // 置いておくだけ。見えるかどうかは CSS(ytm-pointer-active)が決める
+  const r = run({ debugEnabled: false })
   assert.equal(r.present, true)
-  assert.equal(r.pinned, true)
   assert.match(r.text, /LRCLIB/)
 })
 
-test('設定が OFF でもバッジ自体は用意する', () => {
-  // 手を動かした時に出せるよう置いておく。見えるかどうかは CSS が決める
-  const r = run({ showLyricsSource: false, debugEnabled: false })
-  assert.equal(r.present, true)
-  assert.equal(r.pinned, false, '設定 OFF なのに出しっぱなしになっている')
+test('取得元が分からなければ置かない', () => {
+  assert.equal(run({ debugEnabled: false, source: null }).present, false)
 })
 
-test('取得元が分からず設定も OFF なら置かない', () => {
-  assert.equal(run({ showLyricsSource: false, debugEnabled: false, source: null }).present, false)
-})
-
-test('デバッグを立てても画面には出しっぱなしにしない', () => {
-  // 以前はここで強制表示していて、設定を切っても消せなくなっていた
-  assert.equal(run({ showLyricsSource: false, debugEnabled: true }).pinned, false)
+test('出しっぱなしにする経路を作らない', () => {
+  // かつての ytm-source-pinned。設定ごと無くしたので、どこにも残っていないこと
+  for (const [name, src] of [['JS', uiSource], ['CSS', cssSource]]) {
+    assert.doesNotMatch(src, /ytm-source-pinned/, `${name} に出しっぱなしの経路が残っている`)
+  }
+  assert.doesNotMatch(uiSource, /showLyricsSource|show-source-toggle/, '設定の残骸がある')
+  assert.equal(run({ debugEnabled: true }).classes.includes('ytm-source-pinned'), false)
 })
 
 test('デバッグで増えるのはコンソールへの記録だけ', () => {
-  assert.equal(run({ showLyricsSource: false, debugEnabled: true }).logged, 1)
-  assert.equal(run({ showLyricsSource: false, debugEnabled: false }).logged, 0)
+  assert.equal(run({ debugEnabled: true }).logged, 1)
+  assert.equal(run({ debugEnabled: false }).logged, 0)
 })
 
 test('押すと歌詞メニューが開く', () => {
@@ -137,7 +137,7 @@ test('手を動かした時だけ出す(常設しない)', () => {
   assert.match(cssSource, /#ytm-lyrics-source-debug \{[\s\S]*?opacity: 0;/)
   assert.match(
     cssSource,
-    /body\.ytm-pointer-active #ytm-lyrics-source-debug,\s*\n#ytm-lyrics-source-debug\.ytm-source-pinned \{[\s\S]*?opacity: 1;/,
+    /body\.ytm-pointer-active #ytm-lyrics-source-debug \{[\s\S]*?opacity: 1;/,
   )
 })
 
