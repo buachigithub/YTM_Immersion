@@ -42,6 +42,8 @@
         "src/js/module/replay-manager.js",
         "src/js/module/queue-manager.js",
         "src/js/module/pip-manager.js",
+        "src/js/module/ttml-parser.js",
+        "src/js/module/lyric-stagger.js",
         "src/js/module/ytm-lyrics.js",
         "src/js/module/lyrics-ui.js",
         "src/js/content.js"

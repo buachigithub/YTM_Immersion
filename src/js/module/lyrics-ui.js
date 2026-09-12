@@ -4479,41 +4479,57 @@ async function applyLyricsText(rawLyrics) {
     return;
   }
   lastRawLyricsText = rawLyrics;
-  const timedTextData = parseTimedTextAnimation(rawLyrics);
+  const ttmlParser = (typeof TTMLParser !== 'undefined')
+    ? TTMLParser
+    : (typeof window !== 'undefined' ? window.TTMLParser : null);
+  const ttmlParsed = (ttmlParser && ttmlParser.isTTMLString(rawLyrics))
+    ? ttmlParser.parseTTML(rawLyrics)
+    : null;
+
   let parsed = null;
-  if (timedTextData) {
-    if (config.useAnimatedCaptions && !hasCharacterSyncedLines(dynamicLines)) {
-      const canonicalLyrics = String(currentSingerCanonicalLyrics || '');
-      const canonicalSingerLines = canonicalLyrics.trim()
-        ? parseLRCInternal(canonicalLyrics).lines
-        : [];
-      // 歌手メタデータはsrv3とは別APIから遅れて到着する。以前はその時点で
-      // canonical LRCへ描画を切り替えていたため、Animated TimedTextが一瞬だけ
-      // 表示されて通常歌詞へ戻っていた。自由配置のsrv3を表示ソースとして維持し、
-      // 行メタデータだけをplainLinesへ対応付ける。
-      lyricsData = applySingerMetadataToLines(
-        timedTextData.plainLines || [],
-        currentSingerMetadata,
-        {
-          canonicalLines: canonicalSingerLines,
-          sameSource: !canonicalLyrics.trim() || canonicalLyrics.trim() === rawLyrics.trim(),
-        }
-      );
-      timedTextData.plainLines = lyricsData;
-      dynamicLines = null;
-      duetSubDynamicLines = null;
-      renderAnimatedTimedText(timedTextData);
-      if (lyricsData.length) emphasizeSummaryButtonAfterLyricsLoad();
-      refreshMeaningUi();
-      if (meaningPanelVisible) syncMeaningPanelToPlayback(true);
-      return;
-    }
+  if (ttmlParsed && Array.isArray(ttmlParsed.lines) && ttmlParsed.lines.length) {
     animatedCaptionData = null;
     hasTimestamp = true;
-    parsed = timedTextData.plainLines || [];
+    parsed = ttmlParsed.lines;
+    if (ttmlParsed.dynamicLines && ttmlParsed.dynamicLines.length) {
+      dynamicLines = ttmlParsed.dynamicLines;
+    }
   } else {
-    animatedCaptionData = null;
-    parsed = parseBaseLRC(rawLyrics);
+    const timedTextData = parseTimedTextAnimation(rawLyrics);
+    if (timedTextData) {
+      if (config.useAnimatedCaptions && !hasCharacterSyncedLines(dynamicLines)) {
+        const canonicalLyrics = String(currentSingerCanonicalLyrics || '');
+        const canonicalSingerLines = canonicalLyrics.trim()
+          ? parseLRCInternal(canonicalLyrics).lines
+          : [];
+        // 歌手メタデータはsrv3とは別APIから遅れて到着する。以前はその時点で
+        // canonical LRCへ描画を切り替えていたため、Animated TimedTextが一瞬だけ
+        // 表示されて通常歌詞へ戻っていた。自由配置のsrv3を表示ソースとして維持し、
+        // 行メタデータだけをplainLinesへ対応付ける。
+        lyricsData = applySingerMetadataToLines(
+          timedTextData.plainLines || [],
+          currentSingerMetadata,
+          {
+            canonicalLines: canonicalSingerLines,
+            sameSource: !canonicalLyrics.trim() || canonicalLyrics.trim() === rawLyrics.trim(),
+          }
+        );
+        timedTextData.plainLines = lyricsData;
+        dynamicLines = null;
+        duetSubDynamicLines = null;
+        renderAnimatedTimedText(timedTextData);
+        if (lyricsData.length) emphasizeSummaryButtonAfterLyricsLoad();
+        refreshMeaningUi();
+        if (meaningPanelVisible) syncMeaningPanelToPlayback(true);
+        return;
+      }
+      animatedCaptionData = null;
+      hasTimestamp = true;
+      parsed = timedTextData.plainLines || [];
+    } else {
+      animatedCaptionData = null;
+      parsed = parseBaseLRC(rawLyrics);
+    }
   }
   // 歌手メタデータの照合はパース直後の行番号を前提にしているので、
   // 見出し行を落とす前の並びを別に取っておく。
@@ -7719,10 +7735,17 @@ function renderLyrics(data) {
   data.forEach((line, index) => {
     const row = createEl('div', '', 'lyric-line');
 
-    if (line && line.duetSide === 'right') {
+    if (line && (line.duetSide === 'right' || line.isRight)) {
       row.classList.add('sub-vocal');
-    } else if (line && line.duetSide === 'left') {
+      row.classList.add('right-align');
+    } else if (line && (line.duetSide === 'left' || line.isLeft)) {
       row.classList.add('main-vocal');
+    }
+    if (line && line.isCenter) {
+      row.classList.add('center-align');
+    }
+    if (line && line.isBgLine) {
+      row.classList.add('bg-line');
     }
     applySingerMetadataToRow(row, line, currentSingerMetadata);
 
@@ -7798,9 +7821,14 @@ function renderLyrics(data) {
       // そのまま組ませるので、字の間に隙間が出ない。
       const wordSpans = [];
       const units = buildLyricWordUnits(dyn.chars, lineEndSec);
+      const hasBgWords = Array.isArray(line?.words) && line.words.some(w => w.isBg);
+      const mainContainer = hasBgWords ? createEl('div', '', 'main-vocal-container') : null;
+      const bgContainer = hasBgWords ? createEl('div', '', 'bg-vocal-container') : null;
+
       for (const phrase of groupLyricUnitsIntoPhrases(units)) {
         // まとまりごとに inline-block で包む。折り返せるのはこの外側だけ。
         const phraseSpan = createEl('span', '', 'lyric-phrase lyric-phrase-sync');
+        let phraseIsBg = false;
         for (const unit of phrase) {
           if (unit.type === 'space') {
             phraseSpan.appendChild(document.createTextNode(unit.text));
@@ -7814,6 +7842,15 @@ function renderLyrics(data) {
           wordSpan._start = unit.start;
           wordSpan._end = unit.end;
           wordSpan._emp = false;
+
+          if (hasBgWords) {
+            const matchedWord = line.words.find(w => w.text && (w.text.includes(unit.text) || unit.text.includes(w.text)));
+            if (matchedWord && matchedWord.isBg) {
+              phraseIsBg = true;
+              wordSpan.classList.add('bg-word');
+            }
+          }
+
           // PIP は innerHTML で複製するので JS のプロパティが消える。
           // 向こうで組み直せるように、時刻は属性にも書いておく。
           wordSpan.dataset.wt = unit.times
@@ -7822,7 +7859,21 @@ function renderLyrics(data) {
           phraseSpan.appendChild(wordSpan);
           wordSpans.push(wordSpan);
         }
-        if (phraseSpan.childNodes.length) mainSpan.appendChild(phraseSpan);
+        if (phraseSpan.childNodes.length) {
+          if (hasBgWords) {
+            if (phraseIsBg && bgContainer) {
+              bgContainer.appendChild(phraseSpan);
+            } else if (mainContainer) {
+              mainContainer.appendChild(phraseSpan);
+            }
+          } else {
+            mainSpan.appendChild(phraseSpan);
+          }
+        }
+      }
+      if (hasBgWords) {
+        if (mainContainer && mainContainer.childNodes.length) mainSpan.appendChild(mainContainer);
+        if (bgContainer && bgContainer.childNodes.length) mainSpan.appendChild(bgContainer);
       }
       if (wordSpans.length) {
         row._ytmWordSpans = wordSpans;
@@ -8490,7 +8541,16 @@ function updateLyricHighlight(currentTime) {
             programmaticScrollMaxTimeout = setTimeout(() => { isProgrammaticScrolling = false; }, 1200);
             if (scrollBehavior === 'auto') suppressUserScrollDetection(300);
 
-            requestLyricScroll(container, targetScroll, scrollBehavior === 'auto');
+            const staggerModule = (typeof LyricStagger !== 'undefined')
+              ? LyricStagger
+              : (typeof window !== 'undefined' ? window.LyricStagger : null);
+            const staggered = (scrollBehavior !== 'auto' && staggerModule)
+              ? staggerModule.performStaggerScroll(container, targetScroll, idx, { isUserScrolling })
+              : false;
+
+            if (!staggered) {
+              requestLyricScroll(container, targetScroll, scrollBehavior === 'auto');
+            }
 
             container._lastScrolledIndex = idx;
             ReplayManager.incrementLyricCount();
@@ -8504,7 +8564,16 @@ function updateLyricHighlight(currentTime) {
             const targetScroll = container.scrollTop + rRect.top - containerRect.top - (container.clientHeight * 0.35) + (rRect.height / 2);
 
             container._isProgrammaticScrolling = true;
-            requestLyricScroll(container, targetScroll, scrollBehavior === 'auto');
+            const staggerModule = (typeof LyricStagger !== 'undefined')
+              ? LyricStagger
+              : (typeof window !== 'undefined' ? window.LyricStagger : null);
+            const staggered = (scrollBehavior !== 'auto' && staggerModule)
+              ? staggerModule.performStaggerScroll(container, targetScroll, idx, { isUserScrolling: !!container._isUserScrolling })
+              : false;
+
+            if (!staggered) {
+              requestLyricScroll(container, targetScroll, scrollBehavior === 'auto');
+            }
 
             container._lastScrolledIndex = idx;
           }
