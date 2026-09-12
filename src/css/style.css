@@ -1248,6 +1248,29 @@ body.ytm-custom-layout div#ytm-custom-wrapper ytmusic-av-toggle.inactive.moviemo
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
 }
 
+/* 縦積みの行(メイン言語・サブ言語・取得元)では、ピル列を行幅いっぱいに使う。
+   .setting-row.stacked は align-items: stretch なので、inline-flex のままだと
+   枠だけが行幅まで伸びて中のピルは左に寄り、右側が空いた箱に見えていた。
+   枠を縮めるのではなく中身を広げる。行の他の部品(トグル・スライダー)が
+   どれも行幅いっぱいなので、こちらの方が収まりがよい。
+   長いラベルほど広く取れるよう、等分(flex-basis: 0)ではなく
+   自然な幅からの伸長(flex-basis: auto)にしてある。 */
+.setting-row.stacked .ytm-lang-group {
+  display: flex;
+}
+
+.setting-row.stacked .ytm-lang-pill {
+  flex: 1 1 0;
+  min-width: max-content;
+}
+
+/* Daily Replay の期間切り替えも同じ理由で枠だけ伸びていた。
+   こちらは親が最大 1200px あり、3つのピルを広げると間延びするので、
+   枠の方を中身に合わせる。 */
+#ytm-replay-panel .ytm-lang-group {
+  align-self: flex-start;
+}
+
 #ytm-lyrics-stage {
   position: relative;
   /* 高さは意図的にビューポート基準のまま残す。
@@ -2708,10 +2731,9 @@ tp-yt-paper-listbox.ytmusic-menu-popup-renderer {
   transform: translateY(4px);
 }
 
-/* 歌詞の取得元のデバッグ表示。
-   localStorage.ytm_debug = '1' の時だけ生成されるので、
-   ここでは常時表示のスタイルだけ持たせておく。
-   フォールバック通知と重ならないよう左下に置く。 */
+/* 歌詞の取得元の表示。押すと歌詞メニュー(取得元の切り替え / ズレ直し)が開く。
+   ボタン列の真下に入れず body に置かれた時のために、隅への固定も持たせておく。
+   フォールバック通知と重ならないよう左下。 */
 #ytm-lyrics-source-debug {
   position: fixed;
   left: 18px;
@@ -2735,14 +2757,12 @@ tp-yt-paper-listbox.ytmusic-menu-popup-renderer {
 
   /* 既定では見えない。手を動かした時だけ出す(ytm-pointer-active)。
      聴いているだけの間は画面に何も足さないため。
-     設定「いまの取得元を画面に表示する」を ON にした人は出しっぱなし
-     (ytm-source-pinned)で、今までどおりの見え方になる。 */
+     出しっぱなしにする設定は置かない(lyrics-ui.js の「取得元の表示」を参照)。 */
   opacity: 0;
   pointer-events: none;
   transform: translateY(4px);
   transition: opacity 0.22s ease, transform 0.22s ease;
   cursor: pointer;
-  user-select: none;
   user-select: none;
 }
 
@@ -2756,8 +2776,7 @@ tp-yt-paper-listbox.ytmusic-menu-popup-renderer {
   max-width: min(360px, 100%);
 }
 
-body.ytm-pointer-active #ytm-lyrics-source-debug,
-#ytm-lyrics-source-debug.ytm-source-pinned {
+body.ytm-pointer-active #ytm-lyrics-source-debug {
   opacity: 1;
   pointer-events: auto;
   transform: translateY(0);
